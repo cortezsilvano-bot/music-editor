@@ -1,0 +1,12 @@
+# Core service - small, always needed.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+soundfile>=0.12
+numpy>=1.26
+scipy>=1.11
+
+# Optional, but strongly recommended: the Demucs backend.
+# Without these the service still runs and falls back to DSP separation.
+demucs>=4.0.1
+torch>=2.2

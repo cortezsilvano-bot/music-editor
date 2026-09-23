@@ -1,0 +1,41 @@
+# Secrets — never commit. .env holds a live API key.
+.env
+.env.*
+!.env.example
+
+# Audio. The user's own tracks; large and not ours to publish.
+demo/
+tabla/
+*.wav
+*.mp3
+*.flac
+*.aiff
+*.m4a
+
+# Dependencies and build output — all regenerable.
+node_modules/
+app/dist/
+app/release/
+app/bench/fixtures/
+server/.venv*/
+__pycache__/
+*.pyc
+
+# The original Google AI Studio export: a compiled bundle with no source, so
+# there is nothing meaningful to version.
+assets/
+index.html
+
+# Stem separation output and local caches.
+server/jobs/
+.music-editor-backups/
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.log
+
+# TypeScript incremental build cache
+*.tsbuildinfo
