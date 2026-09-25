@@ -7,15 +7,22 @@
  *
  * Desktop only: a browser cannot modify the user's files. On the web the panel
  * explains that instead of offering a button that cannot work.
+ *
+ * Tracks that still need review are blocked from tag write unless the user
+ * checks "Write despite review" (same override pattern as low confidence).
  */
 import { useEffect, useMemo, useState } from "react";
 import type { StoredTrack } from "../db/library";
+import { needsReview, reviewReasons } from "../db/review";
 import { isDesktop, writeTags, type TagWriteResult } from "../desktop/bridge";
 import {
   buildWritePlan,
   toWritePayload,
   type TagField,
 } from "../metadata/writePlan";
+import { createLogger } from "../util/logger";
+
+const log = createLogger("tag-write");
 
 interface Props {
   track: StoredTrack;
@@ -27,9 +34,13 @@ export function TagWritePanel({ track, filePath }: Props) {
   const [includeCamelot, setIncludeCamelot] = useState(false);
   const [includeComment, setIncludeComment] = useState(false);
   const [override, setOverride] = useState(false);
+  const [overrideReview, setOverrideReview] = useState(false);
   const [selected, setSelected] = useState<Set<TagField>>(new Set());
   const [result, setResult] = useState<TagWriteResult | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const inReview = needsReview(track);
+  const reasons = useMemo(() => (inReview ? reviewReasons(track) : []), [track, inReview]);
 
   const plan = useMemo(
     () =>
@@ -46,11 +57,19 @@ export function TagWritePanel({ track, filePath }: Props) {
   useEffect(() => {
     setSelected(new Set(plan.changes.filter((c) => c.selected).map((c) => c.field)));
     setResult(null);
-  }, [plan]);
+    setOverrideReview(false);
+  }, [plan, track.id]);
 
   const desktop = isDesktop();
   const writable = plan.changes.filter((c) => c.blocked === null);
-  const canWrite = desktop && filePath !== null && plan.supported && selected.size > 0 && !busy;
+  const reviewBlocks = inReview && !overrideReview;
+  const canWrite =
+    desktop &&
+    filePath !== null &&
+    plan.supported &&
+    selected.size > 0 &&
+    !busy &&
+    !reviewBlocks;
 
   const toggle = (field: TagField) => {
     setSelected((current) => {
@@ -62,11 +81,14 @@ export function TagWritePanel({ track, filePath }: Props) {
   };
 
   const run = async () => {
-    if (!filePath) return;
+    if (!filePath || reviewBlocks) return;
     setBusy(true);
     setResult(null);
     try {
-      setResult(await writeTags(filePath, toWritePayload(plan, selected)));
+      const outcome = await writeTags(filePath, toWritePayload(plan, selected));
+      if (outcome.ok) log.info("tags written", { path: filePath, fields: (outcome.written ?? []).join(",") });
+      else log.error("tag write failed", { path: filePath, error: outcome.error ?? "unknown" });
+      setResult(outcome);
     } finally {
       setBusy(false);
     }
@@ -87,6 +109,14 @@ export function TagWritePanel({ track, filePath }: Props) {
         <p className="muted">
           This track was added by drag-and-drop, so its path on disk is unknown.
           Import the folder instead to enable tag writing.
+        </p>
+      )}
+
+      {inReview && (
+        <p role="status" className="conf amber">
+          Tag write blocked until review is cleared
+          {reasons.length ? `: ${reasons[0]}` : ""}.
+          {reasons.length > 1 ? ` (+${reasons.length - 1} more)` : ""}
         </p>
       )}
 
@@ -157,6 +187,16 @@ export function TagWritePanel({ track, filePath }: Props) {
           />
           Allow low confidence
         </label>
+        {inReview && (
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={overrideReview}
+              onChange={(e) => setOverrideReview(e.target.checked)}
+            />
+            Write despite review
+          </label>
+        )}
       </div>
 
       <div className="ge-row">

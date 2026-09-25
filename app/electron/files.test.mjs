@@ -17,8 +17,10 @@ const NodeID3 = require("node-id3");
 const { readFlacComments, parseBlocks } = require("./flac.cjs");
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const SOURCE_MP3 = path.resolve(here, "..", "..", "demo", "la-revoltoza.mp3");
-const FIXTURE_FLAC = path.join(tmpdir(), "me-fixture.flac");
+// Synthetic sine tones committed with the tests. The user's own tracks are
+// deliberately kept out of the repository, so CI cannot depend on them.
+const SOURCE_MP3 = path.join(here, "fixtures", "tone.mp3");
+const FIXTURE_FLAC = path.join(here, "fixtures", "tone.flac");
 
 let root;
 let target;
@@ -184,5 +186,20 @@ describe("FLAC tagging", () => {
 
   it("backs up the FLAC before its first write", () => {
     expect(existsSync(path.join(root, ".music-editor-backups", "real.flac"))).toBe(true);
+  });
+});
+
+describe("pathStatus", () => {
+  it("reports an existing granted file", async () => {
+    const status = await files.pathStatus(target);
+    expect(status.ok).toBe(true);
+    expect(status.exists).toBe(true);
+    expect(status.sizeBytes).toBeGreaterThan(0);
+  });
+
+  it("reports a missing path without throwing", async () => {
+    const status = await files.pathStatus(path.join(root, "gone.mp3"));
+    expect(status.ok).toBe(true);
+    expect(status.exists).toBe(false);
   });
 });

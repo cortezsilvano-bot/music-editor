@@ -1,287 +1,196 @@
-/**
- * Stem separation panel (research Phase M).
- *
- * The separation engine lives in a separate process, so the first thing this
- * panel does is ask whether it is running. Not running is an ordinary state,
- * not an error, and it is reported with the command to start it rather than a
- * failure message.
- *
- * Results are cached by the recording's audio hash, so re-opening a track shows
- * its stems immediately and the expensive work happens once.
- */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { StoredTrack } from "../db/library";
+import { useEffect, useRef, useState } from "react";
+import { liveQuery } from "dexie";
+import { db, type AnalysisJob, type StoredTrack } from "../db/library";
+import { allCached, cacheSize, DEFAULT_CACHE_LIMIT_BYTES, removeCached, setPinned, type CachedStem, type StemCacheEntry } from "../db/stems";
+import { checkService, stemColour, type ServiceStatus } from "../stems/service";
 import {
-  allCached,
-  cacheSize,
-  checkStemsPlausible,
-  DEFAULT_CACHE_LIMIT_BYTES,
-  enforceCacheLimit,
-  getCachedStems,
-  putCachedStems,
-  removeCached,
-  setPinned,
-  type StemCacheEntry,
-} from "../db/stems";
-import {
-  checkService,
-  downloadStems,
-  separate,
-  stemColour,
-  type ServiceStatus,
-} from "../stems/service";
-
+  isDesktop,
+  pickStemsServerRoot,
+  startStemsService,
+  stemsServiceStatus,
+  stopStemsService,
+  type StemsServiceStatus,
+} from "../desktop/bridge";
 interface Props {
   track: StoredTrack;
+  onQueue: (options: NonNullable<AnalysisJob["stemOptions"]>) => Promise<void>;
+  onCancel: () => Promise<void>;
+}
+function bytes(value: number) { return `${(value / 1024 ** 2).toFixed(1)} MB`; }
+
+function StemPreview({ stem, solo, onSolo, mutedBySolo }: {
+  stem: CachedStem; solo: boolean; onSolo: () => void; mutedBySolo: boolean;
+}) {
+  const [url, setUrl] = useState("");
+  const [muted, setMuted] = useState(false);
+  const [volume, setVolume] = useState(1);
+  const audio = useRef<HTMLAudioElement>(null);
+  useEffect(() => {
+    const next = URL.createObjectURL(stem.blob); setUrl(next);
+    return () => URL.revokeObjectURL(next);
+  }, [stem.blob]);
+  useEffect(() => { if (audio.current) audio.current.volume = volume; }, [volume]);
+  return <tr><td><span className="stem-dot" style={{ background: stemColour(stem.type) }} />{stem.type}</td>
+    <td>{bytes(stem.blob.size)}</td><td><audio ref={audio} controls preload="none" src={url} muted={muted || mutedBySolo} /></td>
+    <td><button aria-pressed={muted} onClick={() => setMuted(!muted)}>Mute {stem.type}</button>
+      <button aria-pressed={solo} onClick={onSolo}>Solo {stem.type}</button>
+      <input type="range" aria-label={`${stem.type} volume`} min="0" max="1" step="0.01" value={volume} onChange={event => setVolume(Number(event.target.value))} />
+      <a href={url} download={stem.name}>Save</a></td></tr>;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes > 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
-  if (bytes > 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
-  return `${(bytes / 1024).toFixed(0)} KB`;
-}
-
-export function StemsPanel({ track }: Props) {
+/** Durable queue state is independent of panel selection and service availability. */
+export function StemsPanel({ track, onQueue, onCancel }: Props) {
   const [status, setStatus] = useState<ServiceStatus | null>(null);
-  const [entry, setEntry] = useState<StemCacheEntry | null>(null);
-  const [running, setRunning] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [usage, setUsage] = useState({ bytes: 0, entries: 0, pinned: 0 });
+  const [managed, setManaged] = useState(false);
+  const [layout, setLayout] = useState<Pick<StemsServiceStatus, "serverRoot" | "serverPresent" | "python">>({});
+  const [entries, setEntries] = useState<StemCacheEntry[]>([]);
+  const [entryId, setEntryId] = useState<string | null>(null);
+  const [job, setJob] = useState<AnalysisJob>();
   const [quality, setQuality] = useState<"balanced" | "high">("balanced");
-  const abortRef = useRef<AbortController | null>(null);
+  const [error, setError] = useState("");
+  const [solo, setSolo] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [usage, setUsage] = useState({ bytes: 0, entries: 0, pinned: 0 });
+  const [serviceBusy, setServiceBusy] = useState(false);
+  const running = job?.status === "running" || job?.status === "queued";
+  const entry = entries.find(row => row.id === entryId) ?? entries[0];
+  const desktop = isDesktop();
 
-  const model = useMemo(
-    () => (status?.backend === "demucs" ? `demucs/${status.model ?? "htdemucs"}` : "dsp"),
-    [status],
-  );
-
-  useEffect(() => {
-    void checkService().then(setStatus);
-  }, []);
-
-  const refreshUsage = useCallback(async () => setUsage(await cacheSize()), []);
-  useEffect(() => {
-    void refreshUsage();
-  }, [refreshUsage]);
-
-  // Look for an existing result whenever the track or engine changes.
-  useEffect(() => {
-    let cancelled = false;
-    setEntry(null);
-    if (!track.audioHash || !status?.reachable) return;
-    void getCachedStems(track.audioHash, model).then((found) => {
-      if (!cancelled) setEntry(found ?? null);
+  function applyManaged(managedStatus: StemsServiceStatus) {
+    setManaged(!!managedStatus.managed);
+    setLayout({
+      serverRoot: managedStatus.serverRoot ?? null,
+      serverPresent: managedStatus.serverPresent,
+      python: managedStatus.python ?? null,
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [track.audioHash, model, status?.reachable]);
+  }
 
-  // Elapsed time instead of a progress bar: the service answers only when the
-  // whole job is done, so any percentage would be invented.
+  async function refreshStatus() {
+    const http = await checkService();
+    setStatus(http);
+    if (desktop && typeof window.desktop?.stemsServiceStatus === "function") {
+      const managedStatus = await stemsServiceStatus();
+      applyManaged(managedStatus);
+    } else {
+      setManaged(false);
+      setLayout({});
+    }
+  }
+
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const http = await checkService();
+      if (!alive) return;
+      setStatus(http);
+      if (isDesktop() && typeof window.desktop?.stemsServiceStatus === "function") {
+        const managedStatus = await stemsServiceStatus();
+        if (alive) applyManaged(managedStatus);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
+  useEffect(() => {
+    setEntries([]); setEntryId(null); setError(""); setSolo(null); setJob(undefined);
+    const subscription = liveQuery(async () => ({
+      entries: track.audioHash ? await db.stemCache.where("audioHash").equals(track.audioHash).toArray() : await db.stemCache.where("trackId").equals(track.id).toArray(),
+      job: await db.jobs.get(`stems:${track.id}`),
+    })).subscribe({ next: value => { setEntries(value.entries.filter(row => !row.sourceHash || !track.contentHash || row.sourceHash === track.contentHash)
+      .sort((a, b) => b.createdAt - a.createdAt)); setJob(value.job); }, error: value => setError(String(value)) });
+    return () => subscription.unsubscribe();
+  }, [track.id, track.audioHash, track.contentHash]);
+  useEffect(() => { const subscription = liveQuery(cacheSize).subscribe({ next: setUsage, error: value => setError(String(value)) }); return () => subscription.unsubscribe(); }, []);
   useEffect(() => {
     if (!running) return;
-    const started = Date.now();
-    const timer = setInterval(() => setElapsed((Date.now() - started) / 1000), 250);
+    const started = job?.startedAt ?? job?.queuedAt ?? Date.now();
+    const timer = setInterval(() => setElapsed(Math.max(0, Date.now() - started) / 1000), 500);
     return () => clearInterval(timer);
-  }, [running]);
+  }, [running, job?.startedAt, job?.queuedAt]);
+  async function perform(action: () => Promise<unknown>) { setError(""); try { await action(); } catch (value) { setError(String(value)); } }
 
-  const run = useCallback(async () => {
-    if (!track.audioHash) {
-      setError("This track has no audio hash yet; wait for analysis to finish.");
-      return;
-    }
-    setRunning(true);
-    setError(null);
-    setElapsed(0);
-    const controller = new AbortController();
-    abortRef.current = controller;
-
+  async function startService() {
+    setServiceBusy(true); setError("");
     try {
-      const result = await separate(track.audio, track.name, {
-        stems: "basic",
-        quality,
-        signal: controller.signal,
-      });
-      const stems = await downloadStems(result, controller.signal);
-
-      const plausible = checkStemsPlausible(stems, track.sizeBytes);
-      if (!plausible.ok) {
-        setError(plausible.reason);
-        return;
+      const result = await startStemsService();
+      if (result.ok === false) setError(result.error || "Could not start the stem service.");
+      else if (result.serverPresent === false) {
+        setError(result.error || "Stem server folder is missing.");
       }
+      await refreshStatus();
+    } finally { setServiceBusy(false); }
+  }
 
-      const saved = await putCachedStems({
-        audioHash: track.audioHash,
-        model: result.backend === "demucs" ? `demucs/${status?.model ?? "htdemucs"}` : "dsp",
-        trackId: track.id,
-        trackName: track.name,
-        stems,
-      });
-      setEntry(saved);
+  async function stopService() {
+    setServiceBusy(true); setError("");
+    try {
+      await stopStemsService();
+      await refreshStatus();
+    } finally { setServiceBusy(false); }
+  }
 
-      const evicted = await enforceCacheLimit();
-      if (evicted.blockedByPins) {
-        setError("Stem cache is over its limit and every entry is pinned.");
-      }
-      await refreshUsage();
-    } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") {
-        setError("Cancelled.");
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      setRunning(false);
-      abortRef.current = null;
-    }
-  }, [track, quality, status, refreshUsage]);
+  async function chooseServerFolder() {
+    setServiceBusy(true); setError("");
+    try {
+      const result = await pickStemsServerRoot();
+      if (result.cancelled) return;
+      if (result.ok === false) setError(result.error || "Could not set the server folder.");
+      await refreshStatus();
+    } finally { setServiceBusy(false); }
+  }
 
-  const download = (name: string, blob: Blob) => {
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = name;
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
+  const missingServer = desktop && layout.serverPresent === false;
 
-  return (
-    <div className="export-panel">
-      <h3>Stems</h3>
-
-      {status === null && <p className="muted">Checking for the separation service…</p>}
-
-      {status && !status.reachable && (
-        <>
-          <p className="conf amber">{status.error}</p>
-          <p className="muted">
-            Separation runs in a separate process because it needs PyTorch, which
-            is far too large to ship inside this app. Start it with:
-          </p>
-          <pre className="cmd">cd server{"\n"}.\run.ps1</pre>
-          <button className="ghost small" onClick={() => void checkService().then(setStatus)}>
-            Check again
-          </button>
-        </>
-      )}
-
-      {status?.reachable && (
-        <>
-          <div className="ge-row">
-            <span className="ge-label">Engine</span>
-            <span className="value">
-              {status.backend === "demucs" ? `Demucs (${status.model})` : "DSP fallback"}
-            </span>
-            {status.backend === "demucs" && (
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={quality === "high"}
-                  disabled={running}
-                  onChange={(e) => setQuality(e.target.checked ? "high" : "balanced")}
-                />
-                Higher quality (slower)
-              </label>
-            )}
-          </div>
-
-          <div className="ge-row">
-            <button className="ghost small" disabled={running} onClick={() => void run()}>
-              {entry ? "Separate again" : "Separate"}
-            </button>
-            {running && (
-              <>
-                <span className="muted">Separating… {elapsed.toFixed(0)}s</span>
-                <button className="ghost small" onClick={() => abortRef.current?.abort()}>
-                  Cancel
-                </button>
-              </>
-            )}
-            {!running && entry && (
-              <span className="muted">
-                Cached {formatBytes(entry.sizeBytes)} · {entry.model}
-              </span>
-            )}
-          </div>
-
-          {error && <p className="conf red">{error}</p>}
-
-          {entry && (
-            <table className="changes">
-              <tbody>
-                {entry.stems.map((stem) => (
-                  <tr key={stem.name}>
-                    <td>
-                      <span
-                        className="stem-dot"
-                        style={{ background: stemColour(stem.type) }}
-                      />
-                      {stem.type}
-                    </td>
-                    <td className="muted">{formatBytes(stem.blob.size)}</td>
-                    <td>
-                      <audio controls preload="none" src={URL.createObjectURL(stem.blob)} />
-                    </td>
-                    <td>
-                      <button
-                        className="ghost small"
-                        onClick={() => download(stem.name, stem.blob)}
-                      >
-                        Save
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-
-          {entry && (
-            <div className="ge-row">
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={entry.pinned}
-                  onChange={async (e) => {
-                    await setPinned(entry.id, e.target.checked);
-                    setEntry({ ...entry, pinned: e.target.checked });
-                    await refreshUsage();
-                  }}
-                />
-                Keep (never evict)
-              </label>
-              <button
-                className="ghost small"
-                onClick={async () => {
-                  await removeCached(entry.id);
-                  setEntry(null);
-                  await refreshUsage();
-                }}
-              >
-                Delete stems
-              </button>
-            </div>
-          )}
-
-          <p className="muted">
-            Cache: {formatBytes(usage.bytes)} of {formatBytes(DEFAULT_CACHE_LIMIT_BYTES)} ·{" "}
-            {usage.entries} track(s), {usage.pinned} kept.{" "}
-            <button
-              className="linkish"
-              onClick={async () => {
-                const all = await allCached();
-                for (const row of all) if (!row.pinned) await removeCached(row.id);
-                setEntry(null);
-                await refreshUsage();
-              }}
-            >
-              Clear unkept
-            </button>
-          </p>
-        </>
-      )}
+  return <div className="export-panel"><h3>Stems</h3>
+    {!status && <p className="muted">Checking separation service...</p>}
+    {status && (!status.reachable || status.jobProtocol !== 2) && <p className="conf amber">
+      {status.reachable ? "Restart the updated separation service to enable durable jobs." : status.error}
+      <button onClick={() => void perform(refreshStatus)}>Check again</button></p>}
+    {desktop && (
+      <div className="ge-row">
+        <span className="muted">
+          Service: {status?.reachable ? "reachable" : "offline"}
+          {managed ? " (started by app)" : status?.reachable ? " (external)" : ""}
+        </span>
+        <button disabled={serviceBusy || !!status?.reachable} onClick={() => void startService()}>Start service</button>
+        <button disabled={serviceBusy || !managed} onClick={() => void stopService()}>Stop service</button>
+        <button disabled={serviceBusy} onClick={() => void chooseServerFolder()}>Choose server folder…</button>
+      </div>
+    )}
+    {desktop && (
+      <p className="muted">
+        Server: {layout.serverRoot ?? "(resolving…)"}
+        {layout.serverPresent === false ? " — missing app.py" : layout.serverPresent ? "" : ""}
+        {layout.python ? ` · Python: ${layout.python}` : ""}
+      </p>
+    )}
+    {missingServer && (
+      <p role="alert" className="conf red">
+        Stem server source not found. Packaged installs include resources/server
+        (no venv / no Demucs weights). Install system Python, then
+        `pip install -r requirements.txt` in that folder, or choose a checkout
+        server/ folder. Env: MUSIC_EDITOR_SERVER_ROOT.
+      </p>
+    )}
+    <p className="muted">The app never auto-starts the Python service. Start here, or run `server/run.ps1` yourself. Demucs weights are not bundled.</p>
+    <div className="ge-row"><span>Engine: {status?.backend === "demucs" ? `Demucs (${status.model})` : "DSP fallback"}</span>
+      <label><input type="checkbox" checked={quality === "high"} disabled={running} onChange={event => setQuality(event.target.checked ? "high" : "balanced")} />Higher quality</label>
+      <button disabled={running || job?.remoteCancelPending || !track.audioHash || !status?.reachable || status.jobProtocol !== 2}
+        onClick={() => void perform(() => onQueue({ backend: status!.backend ?? "dsp", quality, stems: "basic" }))}>{entry ? "Separate again" : "Separate"}</button>
+      {running && <><span>{job?.stage ?? job?.status} ({elapsed.toFixed(0)}s)</span><button onClick={() => void perform(onCancel)}>Cancel separation</button></>}
     </div>
-  );
+    <p className="muted">Work continues when you select another track. Reopening the app reconnects to the same server job. Stages are shown without an estimated percentage.</p>
+    {job?.remoteCancelPending && <p className="conf amber">Cancellation saved. Waiting for the service to acknowledge it.</p>}
+    {(error || job?.error) && <p role="alert" className="conf red">{error || job?.error}</p>}
+    {entries.length > 1 && <label>Cached result <select value={entry?.id ?? ""} onChange={event => { setEntryId(event.target.value); setSolo(null); }}>
+      {entries.map(row => <option key={row.id} value={row.id}>{row.model} {row.quality ?? "legacy"} - {new Date(row.createdAt).toLocaleString()}</option>)}
+    </select></label>}
+    {entry && <><p className="muted">Cached {bytes(entry.sizeBytes)} - {entry.model} {entry.modelVersion ?? "legacy version"} - {entry.device ?? "device not recorded"}</p>
+      {entry.fallbackReason && <p className="conf amber">CPU fallback: {entry.fallbackReason}</p>}
+      <table className="changes"><tbody>{entry.stems.map(stem => <StemPreview key={`${entry.id}:${stem.name}`} stem={stem} solo={solo === stem.name}
+        mutedBySolo={solo !== null && solo !== stem.name} onSolo={() => setSolo(solo === stem.name ? null : stem.name)} />)}</tbody></table>
+      <div className="ge-row"><label><input type="checkbox" checked={entry.pinned} onChange={event => void perform(() => setPinned(entry.id, event.target.checked))} />Keep (never evict)</label>
+        <button onClick={() => void perform(() => removeCached(entry.id))}>Delete stems</button></div></>}
+    <p className="muted">Cache: {bytes(usage.bytes)} / {bytes(DEFAULT_CACHE_LIMIT_BYTES)}; {usage.entries} results, {usage.pinned} kept.
+      <button onClick={() => void perform(async () => { for (const row of await allCached()) if (!row.pinned) await removeCached(row.id); })}>Clear unkept</button></p>
+  </div>;
 }

@@ -108,6 +108,15 @@ export async function readTags(file: Blob): Promise<TrackTags> {
   }
 }
 
+/** Container duration avoids decoding a long file just to import it. */
+export async function readMediaMetadata(file: Blob): Promise<{ tags: TrackTags; durationSec: number | null }> {
+  try {
+    const metadata = await parseBlob(file, { duration: true, skipCovers: true });
+    const duration = metadata.format.duration;
+    return { tags: toTrackTags(metadata), durationSec: duration && Number.isFinite(duration) && duration > 0 ? duration : null };
+  } catch { return { tags: { ...EMPTY_TAGS }, durationSec: null }; }
+}
+
 /**
  * Best available display name.
  *

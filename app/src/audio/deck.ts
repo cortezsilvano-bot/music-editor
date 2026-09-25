@@ -7,7 +7,7 @@
  *
  *   worklet -> low/mid/high EQ -> channel gain -> crossfader gain
  *                                                      |
- *                              both decks ------------> master gain -> limiter -> out
+ *                              both decks ------------> master gain -> safety limiter -> monitoring master -> out
  *
  * Sync uses the stored beat grids, not a visual estimate: matching tempo is a
  * ratio of two BPMs, and matching phase means moving one deck's playhead to the
@@ -16,11 +16,16 @@
  */
 import workletUrl from "./deck-processor.js?audio-worklet";
 import { deriveBeatTimes, type BeatGrid } from "../dsp/beats";
+import { setAudioOutputDevice, supportsAudioOutputSelection } from "./devices";
+import { MasterBus } from "./masterBus";
+import type { MasteringSettings } from "./mastering";
 
 export type DeckId = "A" | "B";
 
 export interface DeckState {
   loaded: boolean;
+  /** True when the deck is on MediaElement streaming (no full PCM / no WSOLA). */
+  streaming: boolean;
   playing: boolean;
   positionSec: number;
   durationSec: number;
@@ -63,6 +68,16 @@ export class Deck {
   /** Loop to restore when a roll is released, if one was running. */
   private rollPrevious: { startSec: number; endSec: number; beats: number } | null = null;
 
+  /** MediaElement path for oversized tracks (bounded memory; no WSOLA). */
+  private media: HTMLAudioElement | null = null;
+  private mediaNode: MediaElementAudioSourceNode | null = null;
+  private mediaUrl: string | null = null;
+  private cancelMediaLoad: (() => void) | null = null;
+  private durationHint = 0;
+  private streamReady = false;
+  private playRequest = 0;
+  private positionTimer: number | null = null;
+
   grid: BeatGrid | null = null;
   durationSec = 0;
   hotCues: HotCue[] = [];
@@ -100,7 +115,14 @@ export class Deck {
     await context.audioWorklet.addModule(workletUrl);
   }
 
+  /** True while this deck plays via HTMLAudioElement (no full PCM in the worklet). */
+  get streaming(): boolean {
+    return this.media !== null;
+  }
+
   async load(buffer: AudioBuffer, grid: BeatGrid | null): Promise<void> {
+    this.clearStreamTransport();
+
     if (!this.node) {
       this.node = new AudioWorkletNode(this.context, "deck-processor", {
         numberOfInputs: 0,
@@ -108,7 +130,11 @@ export class Deck {
         outputChannelCount: [2],
       });
       this.node.port.onmessage = (event) => this.handleMessage(event.data);
+    }
+    try {
       this.node.connect(this.lowEq);
+    } catch {
+      // Already connected.
     }
 
     // Copy out of the AudioBuffer so the transfer does not detach anything the
@@ -126,12 +152,107 @@ export class Deck {
     this.playing = false;
     this.loop = null;
     this.hotCues = [];
+    this.streamReady = false;
 
     this.node.port.postMessage({ type: "load", channels }, channels);
     this.emit();
   }
 
+  /**
+   * Load a long track via the browser media pipeline.
+   *
+   * Bounded memory: no full AudioBuffer, no WSOLA. EQ/gain/crossfade still apply
+   * through the existing graph. Tempo is HTMLMediaElement.playbackRate (pitch
+   * follows). Beat loops / slip / rolls stay unavailable.
+   */
+  async loadStream(blob: Blob, durationHint: number, grid: BeatGrid | null): Promise<void> {
+    this.clearStreamTransport();
+    this.node?.port.postMessage({ type: "eject" });
+    if (this.node) {
+      try {
+        this.node.disconnect();
+      } catch {
+        // Not connected.
+      }
+    }
+
+    const media = new Audio();
+    this.media = media;
+    this.durationHint = durationHint;
+    this.mediaUrl = URL.createObjectURL(blob);
+    media.preload = "metadata";
+    media.playbackRate = this.rate;
+    this.mediaNode = this.context.createMediaElementSource(media);
+    this.mediaNode.connect(this.lowEq);
+
+    media.onended = () => {
+      if (this.media !== media) return;
+      this.playing = false;
+      this.stopPositionTimer();
+      this.emit();
+    };
+    media.onerror = () => {
+      if (this.media !== media) return;
+      this.playing = false;
+      this.stopPositionTimer();
+      this.emit();
+    };
+
+    this.durationSec = durationHint;
+    this.grid = grid;
+    this.positionSample = 0;
+    this.lengthSamples = 0;
+    this.playing = false;
+    this.loop = null;
+    this.hotCues = [];
+    this.streamReady = false;
+    this.sampleRate = this.context.sampleRate;
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          media.removeEventListener("loadedmetadata", loaded);
+          media.removeEventListener("error", failed);
+          if (this.media === media) this.cancelMediaLoad = null;
+        };
+        const loaded = () => {
+          cleanup();
+          resolve();
+        };
+        const failed = () => {
+          cleanup();
+          reject(new Error(media.error?.message || "Unsupported or unreadable streaming audio"));
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error("Timed out opening streaming Mix deck"));
+        }, 30000);
+        this.cancelMediaLoad = () => {
+          cleanup();
+          reject(new DOMException("Track changed", "AbortError"));
+        };
+        media.addEventListener("loadedmetadata", loaded);
+        media.addEventListener("error", failed);
+        media.src = this.mediaUrl!;
+        media.load();
+      });
+    } catch (error) {
+      if (this.media === media) this.clearStreamTransport();
+      throw error;
+    }
+
+    if (Number.isFinite(media.duration) && media.duration > 0) {
+      this.durationSec = media.duration;
+    }
+    this.streamReady = true;
+    this.emit();
+  }
+
   eject(): void {
+    this.playRequest++;
+    this.stopPositionTimer();
+    this.clearStreamTransport();
     this.node?.port.postMessage({ type: "eject" });
     this.playing = false;
     this.positionSample = 0;
@@ -140,7 +261,40 @@ export class Deck {
     this.loop = null;
     this.hotCues = [];
     this.lengthSamples = 0;
+    this.streamReady = false;
     this.emit();
+  }
+
+  private clearStreamTransport(): void {
+    this.cancelMediaLoad?.();
+    this.cancelMediaLoad = null;
+    this.stopPositionTimer();
+    if (this.media) {
+      this.media.onended = null;
+      this.media.onerror = null;
+      this.media.pause();
+      this.media.removeAttribute("src");
+      this.media.load();
+      this.media = null;
+    }
+    this.mediaNode?.disconnect();
+    this.mediaNode = null;
+    if (this.mediaUrl) URL.revokeObjectURL(this.mediaUrl);
+    this.mediaUrl = null;
+    this.durationHint = 0;
+    this.streamReady = false;
+  }
+
+  private startPositionTimer(): void {
+    this.stopPositionTimer();
+    this.positionTimer = setInterval(() => this.emit(), 50) as unknown as number;
+  }
+
+  private stopPositionTimer(): void {
+    if (this.positionTimer !== null) {
+      clearInterval(this.positionTimer);
+      this.positionTimer = null;
+    }
   }
 
   private handleMessage(message: { type: string; sample?: number; length?: number }): void {
@@ -161,11 +315,21 @@ export class Deck {
   }
 
   get state(): DeckState {
+    const streaming = this.streaming;
+    const positionSec = streaming
+      ? (this.media?.currentTime ?? 0)
+      : this.positionSample / this.sampleRate;
+    const durationSec = streaming
+      ? (this.media && Number.isFinite(this.media.duration) && this.media.duration > 0
+          ? this.media.duration
+          : (this.durationHint || this.durationSec))
+      : this.durationSec;
     return {
-      loaded: this.lengthSamples > 0,
+      loaded: streaming ? this.streamReady : this.lengthSamples > 0,
+      streaming,
       playing: this.playing,
-      positionSec: this.positionSample / this.sampleRate,
-      durationSec: this.durationSec,
+      positionSec,
+      durationSec,
       rate: this.rate,
       keyLock: this.keyLock,
       loop: this.loop,
@@ -180,6 +344,20 @@ export class Deck {
   }
 
   async play(): Promise<void> {
+    if (this.streaming) {
+      if (!this.streamReady || !this.media) return;
+      const request = ++this.playRequest;
+      if (this.context.state === "suspended") await this.context.resume();
+      if (request !== this.playRequest || !this.media) return;
+      const media = this.media;
+      if (media.currentTime >= this.state.durationSec) media.currentTime = 0;
+      await media.play();
+      if (request !== this.playRequest || this.media !== media) return;
+      this.playing = true;
+      this.startPositionTimer();
+      this.emit();
+      return;
+    }
     if (this.lengthSamples === 0) return;
     if (this.context.state === "suspended") await this.context.resume();
     this.playing = true;
@@ -188,13 +366,31 @@ export class Deck {
   }
 
   pause(): void {
+    this.playRequest++;
+    if (this.streaming && this.media) {
+      this.media.pause();
+      this.playing = false;
+      this.stopPositionTimer();
+      this.emit();
+      return;
+    }
     this.playing = false;
     this.node?.port.postMessage({ type: "pause" });
     this.emit();
   }
 
   seekSeconds(seconds: number): void {
-    const clamped = Math.max(0, Math.min(seconds, this.durationSec));
+    const duration = this.state.durationSec;
+    const clamped = Math.max(0, Math.min(seconds, duration || this.durationSec));
+    if (this.streaming && this.media) {
+      try {
+        this.media.currentTime = clamped;
+      } catch {
+        // Seeking before readyState can throw; ignore.
+      }
+      this.emit();
+      return;
+    }
     this.positionSample = Math.round(clamped * this.sampleRate);
     this.node?.port.postMessage({ type: "seek", sample: this.positionSample });
     this.emit();
@@ -202,13 +398,22 @@ export class Deck {
 
   setRate(rate: number): void {
     this.rate = Math.max(0.5, Math.min(2, rate));
+    if (this.streaming && this.media) {
+      // Honest: pitch follows rate; WSOLA key-lock is not available on stream.
+      this.media.playbackRate = this.rate;
+      this.emit();
+      return;
+    }
     this.node?.port.postMessage({ type: "rate", value: this.rate });
     this.emit();
   }
 
   setKeyLock(enabled: boolean): void {
     this.keyLock = enabled;
-    this.node?.port.postMessage({ type: "keyLock", value: enabled });
+    // Streaming decks cannot WSOLA-lock pitch; UI disables the control.
+    if (!this.streaming) {
+      this.node?.port.postMessage({ type: "keyLock", value: enabled });
+    }
     this.emit();
   }
 
@@ -220,6 +425,13 @@ export class Deck {
    */
   nudge(amount: number, durationMs = 180): void {
     const base = this.rate;
+    if (this.streaming && this.media) {
+      this.media.playbackRate = base + amount;
+      setTimeout(() => {
+        if (this.media) this.media.playbackRate = base;
+      }, durationMs);
+      return;
+    }
     this.node?.port.postMessage({ type: "rate", value: base + amount });
     setTimeout(() => this.node?.port.postMessage({ type: "rate", value: base }), durationMs);
   }
@@ -252,6 +464,8 @@ export class Deck {
    * asked for and repeated passes do not drift.
    */
   setBeatLoop(beats: number): void {
+    // Sample-accurate loops need the worklet buffer; no-op on stream.
+    if (this.streaming) return;
     const times = this.beatTimes();
     if (times.length < 2 || beats <= 0) return;
     const position = this.state.positionSec;
@@ -311,6 +525,7 @@ export class Deck {
    * does not push the rest of the phrase late.
    */
   setSlip(enabled: boolean): void {
+    if (this.streaming) return;
     this.slip = enabled;
     this.node?.port.postMessage({ type: "slip", value: enabled });
     this.emit();
@@ -321,6 +536,7 @@ export class Deck {
    * roll a roll rather than just a short loop.
    */
   startRoll(beats: number): void {
+    if (this.streaming) return;
     this.rollPrevious = this.loop;
     if (!this.slip) this.node?.port.postMessage({ type: "slip", value: true });
     this.setBeatLoop(beats);
@@ -428,6 +644,7 @@ export class Mixer {
   readonly deckB: Deck;
   private readonly master: GainNode;
   private readonly limiter: DynamicsCompressorNode;
+  readonly masterBus: MasterBus;
   private crossfade = 0.5;
 
   constructor(context: AudioContext) {
@@ -446,7 +663,9 @@ export class Mixer {
     this.deckA.faderGain.connect(this.master);
     this.deckB.faderGain.connect(this.master);
     this.master.connect(this.limiter);
-    this.limiter.connect(context.destination);
+    // Monitoring master (EQ / soft-clip / ceiling) after the deck safety limiter.
+    this.masterBus = new MasterBus(context);
+    this.limiter.connect(this.masterBus.input);
 
     this.setCrossfade(0.5);
   }
@@ -481,6 +700,11 @@ export class Mixer {
     );
   }
 
+  /** Apply monitoring-master settings (shared localStorage key with inspector). */
+  applyMastering(settings: Partial<MasteringSettings>): void {
+    this.masterBus.applySettings(settings);
+  }
+
   /** Gain reduction the limiter is applying, in dB. Negative means working. */
   get limiterReductionDb(): number {
     return this.limiter.reduction;
@@ -489,29 +713,14 @@ export class Mixer {
   /**
    * Route the master output to a specific device.
    *
-   * `AudioContext.setSinkId` is available in current Chromium, so this works in
-   * the desktop build and in a Chromium browser; it is not universal, hence the
-   * capability check rather than an assumption.
+   * Shared with Player via `setAudioOutputDevice` (Chromium `setSinkId`).
    */
   async setOutputDevice(deviceId: string): Promise<boolean> {
-    const context = this.context as AudioContext & {
-      setSinkId?: (id: string) => Promise<void>;
-    };
-    if (typeof context.setSinkId !== "function") return false;
-    try {
-      await context.setSinkId(deviceId === "default" ? "" : deviceId);
-      return true;
-    } catch {
-      return false;
-    }
+    return setAudioOutputDevice(this.context, deviceId);
   }
 
   static get supportsOutputSelection(): boolean {
-    return (
-      typeof AudioContext !== "undefined" &&
-      typeof (AudioContext.prototype as unknown as Record<string, unknown>).setSinkId ===
-        "function"
-    );
+    return supportsAudioOutputSelection();
   }
 
   /** What the browser reports about the output path, for the settings panel. */

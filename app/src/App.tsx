@@ -6,8 +6,16 @@
  * and the library really survives a reload. Nothing here is a placeholder.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { liveQuery } from "dexie";
+import { useCatalog, useTrackDetail } from "./ui/useCatalog";
+import { LibraryList } from "./ui/LibraryList";
+import { JobsPanel } from "./ui/JobsPanel";
+import { AnalysisHistory } from "./ui/AnalysisHistory";
 import { ANALYSIS_VERSION } from "./analysis/pipeline";
 import { Player, type PlayerState } from "./audio/player";
+import { AudioBufferCache } from "./audio/bufferCache";
+import { shouldStream } from "./audio/decodePolicy";
+import { attachAudioContextRecovery } from "./audio/devices";
 import {
   addTrack,
   setAudioHash,
@@ -16,7 +24,6 @@ import {
   removeCue,
   setGridLocked,
   setManualKey,
-  allTracks,
   bpmIsManual,
   effectiveBpm,
   effectiveGridOf,
@@ -26,11 +33,11 @@ import {
   db,
   setManualBpm,
   setManualGrid,
-  type StoredTrack,
+  type AnalysisJob,
 } from "./db/library";
 import { deriveBeatTimes, type BeatGrid } from "./dsp/beats";
 import { camelotLabel, keyName, openKeyLabel } from "./dsp/key";
-import { needsReview, reviewReasons } from "./db/review";
+import { reviewReasons } from "./db/review";
 import { useSetting } from "./ui/settings";
 import { displayName, readTags } from "./metadata/tags";
 import { isDesktop, pickFolder, readFile, scanFolder } from "./desktop/bridge";
@@ -39,10 +46,24 @@ import { DuplicatesPanel } from "./ui/DuplicatesPanel";
 import { ExportPanel } from "./ui/ExportPanel";
 import { MixMode } from "./ui/MixMode";
 import { StemsPanel } from "./ui/StemsPanel";
+import { checkService } from "./stems/service";
+import { stemRunner, cancelRemoteStemJob } from "./stems/jobs";
 import { TagWritePanel } from "./ui/TagWritePanel";
+import { FileLocationPanel } from "./ui/FileLocationPanel";
+import { MissingFilesPanel } from "./ui/MissingFilesPanel";
+import { SettingsPanel } from "./ui/SettingsPanel";
+import { MasteringPanel } from "./ui/MasteringPanel";
+import { PlaylistsPanel } from "./ui/PlaylistsPanel";
+import { ensurePeakPyramid } from "./db/peakPyramids";
+import { getPlaylist } from "./db/playlists";
+import { FEATURE_FLAG_KEYS, useFeatureFlag } from "./ui/features";
 import { GridEditor } from "./ui/GridEditor";
 import { WaveformView } from "./ui/WaveformView";
 import { recommend } from "./analysis/recommendations";
+import { buildAuditionPayload, type AuditionPayload } from "./analysis/audition";
+import { estimatePhrases } from "./dsp/phrase";
+import { barsFromGrid } from "./dsp/structure";
+import { libraryEnergyDisplay } from "./dsp/energy";
 import { logFeedback, recentlyPlayed } from "./db/feedback";
 import { PianoVerifier } from "./ui/PianoVerifier";
 import { AnalysisScheduler } from "./analysis/scheduler";
@@ -82,16 +103,44 @@ function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function humanizeStorageError(error: unknown): string {
+  const text = String(error ?? "");
+  if (/DatabaseClosedError|UnknownError\s+Internal error/i.test(text)) {
+    return "Library storage briefly unavailable. Dismiss and keep working — restart the app if this keeps appearing.";
+  }
+  return text.replace(/^Error:\s*/i, "") || "Something went wrong with library storage.";
+}
+
+
 export function App() {
-  const [tracks, setTracks] = useState<StoredTrack[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [jobs, setJobs] = useState<Record<string, JobState>>({});
+  const [storedJobs, setStoredJobs] = useState<AnalysisJob[]>([]);
+  const [timeoutMinutes, _setTimeoutMinutes] = useSetting("analysisTimeoutMinutes", 5);
   const [playerState, setPlayerState] = useState<PlayerState>("stopped");
   const [position, setPosition] = useState(0);
   const [clickOn, setClickOn] = useState(false);
   const [volume, setVolume] = useSetting("volume", 0.8);
-  const [view, setView] = useState<"library" | "mix" | "duplicates">("library");
+  // Studio (the original app) is the landing view, so the address you already
+  // use opens on the app you already know; the new tools are one click away.
+  const [view, setView] = useState<"studio" | "library" | "mix" | "duplicates">("studio");
+  // Both Studio and the editor use the same splitter; show its state once, here.
+  const [splitterUp, setSplitterUp] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const poll = () => void checkService().then((s) => alive && setSplitterUp(s.reachable));
+    poll();
+    const timer = setInterval(poll, 10000);
+    return () => { alive = false; clearInterval(timer); };
+  }, []);
+  const [featureMixMode] = useFeatureFlag(FEATURE_FLAG_KEYS.mixMode);
+  const [featureStems] = useFeatureFlag(FEATURE_FLAG_KEYS.stems);
+  const [featureDuplicates] = useFeatureFlag(FEATURE_FLAG_KEYS.duplicates);
   const [query, setQuery] = useState("");
+  const [activePlaylistId, setActivePlaylistId] = useState<string | null>(null);
+  const [playlistTracks, setPlaylistTracks] = useState<import("./db/catalog").CatalogTrack[]>([]);
+  const [pyramidLevels, setPyramidLevels] = useState<Float32Array[] | undefined>(undefined);
+  const [page, setPage] = useState(0);
   const [filter, setFilter] = useSetting("filter", "all");
   const [sort, setSort] = useSetting("sort", "added");
   const [cueName, setCueName] = useState("");
@@ -100,29 +149,73 @@ export function App() {
   const playerRef = useRef<Player | null>(null);
   const schedulerRef = useRef<AnalysisScheduler | null>(null);
   const [notice, setNotice] = useState("");
-  const decodedRef = useRef(new Map<string, AudioBuffer>());
+  const [streamingPlayback, setStreamingPlayback] = useState(false);
+  const decodedRef = useRef(new AudioBufferCache());
+  const { result: libraryPage, all: tracks, stats, loading: libraryLoading } = useCatalog(query, filter, sort, page, !!selectedId || view !== "library", setNotice);
+  const catalogVisible = libraryPage.tracks;
+  const visibleTracks = activePlaylistId ? playlistTracks : catalogVisible;
+
+  const selected = useTrackDetail(selectedId, setNotice);
 
   if (playerRef.current === null) playerRef.current = new Player();
   const player = playerRef.current;
 
+  const timeoutMsRef = useRef(Math.max(1, Math.min(60, timeoutMinutes)) * 60_000);
+  timeoutMsRef.current = Math.max(1, Math.min(60, timeoutMinutes)) * 60_000;
+
   useEffect(() => {
     let alive = true;
-    const refresh = () => {
-      void Promise.all([allTracks(), db.jobs.toArray()]).then(([rows, storedJobs]) => {
-        if (!alive) return;
-        setTracks(rows);
-        setJobs(current => Object.fromEntries(storedJobs
-          .filter(j => j.status === "running" || j.status === "queued")
-          .map(j => [j.id, current[j.id] ?? { stage: j.status, progress: 0 }])));
-      }).catch(error => { if (alive) setNotice(String(error)); });
-    };
-    const scheduler = new AnalysisScheduler(workerRunner(player.audioContext), refresh,
+    let jobSubscription: { unsubscribe: () => void } | null = null;
+    const scheduler = new AnalysisScheduler(
+      workerRunner(player.audioContext, decodedRef.current),
+      () => {},
       (id, stage, progress) => {
         if (alive) setJobs(current => ({ ...current, [id]: { stage, progress } }));
-      });
+      },
+      db,
+      timeoutMsRef.current,
+      {
+        stemRunner,
+        cancelRemote: cancelRemoteStemJob,
+        onError: message => {
+          if (!alive) return;
+          const soft = humanizeStorageError(message);
+          setNotice(soft.startsWith("Library storage") ? soft : `Job storage: ${soft}`);
+          if (/DatabaseClosedError|Internal error/i.test(String(message))) {
+            void db.open().catch(() => {});
+          }
+        },
+      },
+    );
     schedulerRef.current = scheduler;
-    void scheduler.start().catch(error => setNotice(String(error)));
-    return () => { alive = false; scheduler.dispose(); schedulerRef.current = null; };
+    void (async () => {
+      try {
+        await db.open();
+        if (!alive) return;
+        jobSubscription = liveQuery(() => db.jobs.toArray()).subscribe({
+          next: rows => {
+            if (!alive) return;
+            setStoredJobs(rows);
+            setJobs(Object.fromEntries(rows.filter(j => j.status === "running" || j.status === "queued")
+              .map(j => [j.id, { stage: j.stage ?? j.status, progress: j.progress ?? 0 }])));
+          },
+          error: error => {
+            if (!alive) return;
+            setNotice(humanizeStorageError(error));
+            void db.open().catch(() => {});
+          },
+        });
+        await scheduler.start();
+      } catch (error) {
+        if (alive) setNotice(humanizeStorageError(error));
+      }
+    })();
+    return () => {
+      alive = false;
+      jobSubscription?.unsubscribe();
+      void scheduler.dispose().catch(error => console.error("Scheduler shutdown", error));
+      schedulerRef.current = null;
+    };
   }, [player]);
 
   // Playhead. Driven by rAF off the audio clock rather than a timer, so the
@@ -142,14 +235,17 @@ export function App() {
     return () => player.setListener({});
   }, [player]);
 
+  // Sleep/wake / device-interrupt recovery for the inspector player (software hooks).
+  useEffect(() => {
+    return attachAudioContextRecovery(player.audioContext, {
+      onSuspended: (message) => setNotice(message),
+      shouldResume: () => player.playerState === "playing",
+    });
+  }, [player]);
+
   useEffect(() => {
     player.setVolume(volume);
   }, [player, volume]);
-
-  const selected = useMemo(
-    () => tracks.find((t) => t.id === selectedId) ?? null,
-    [tracks, selectedId],
-  );
 
   const activeGrid = useMemo(
     () => (selected ? effectiveGridOf(selected) : { grid: null, manual: false }),
@@ -166,16 +262,46 @@ export function App() {
     return new Float32Array(selected.peaks);
   }, [selected]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setPyramidLevels(undefined);
+    if (!selected?.peaks) return;
+    const peaksView = new Float32Array(selected.peaks);
+    void ensurePeakPyramid(selected.id, selected.contentHash, peaksView)
+      .then((pyramid) => { if (!cancelled) setPyramidLevels(pyramid.levels); })
+      .catch((error) => { if (!cancelled) setNotice(String(error)); });
+    return () => { cancelled = true; };
+  }, [selected?.id, selected?.contentHash, selected?.peaks]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!activePlaylistId) { setPlaylistTracks([]); return; }
+    void getPlaylist(activePlaylistId).then(async (playlist) => {
+      if (!playlist || cancelled) return;
+      const rows = await db.trackCatalog.bulkGet(playlist.trackIds);
+      if (cancelled) return;
+      setPlaylistTracks(rows.filter((row): row is NonNullable<typeof row> => !!row));
+    }).catch((error) => { if (!cancelled) setNotice(String(error)); });
+    return () => { cancelled = true; };
+  }, [activePlaylistId, libraryPage.total]);
+
   // Only a selection change loads audio. Refreshing analysis or edits must not seek.
   useEffect(() => {
     player.stop();
+    setStreamingPlayback(false);
     if (!selectedId) return;
     let cancelled = false;
     void (async () => {
+      const track = await db.tracks.get(selectedId);
+      if (!track || cancelled) return;
+      if (shouldStream(track)) {
+        // Long files stay on the browser media pipeline; do not fill decodedRef with PCM.
+        await player.loadStream(track.audio, track.durationSec);
+        if (!cancelled) setStreamingPlayback(true);
+        return;
+      }
       let buffer = decodedRef.current.get(selectedId);
       if (!buffer) {
-        const track = await db.tracks.get(selectedId);
-        if (!track || cancelled) return;
         buffer = await player.audioContext.decodeAudioData(await track.audio.arrayBuffer());
         if (cancelled) return;
         decodedRef.current.set(selectedId, buffer);
@@ -215,9 +341,9 @@ export function App() {
         // Catches the same master in another container; the file hash cannot.
         void computeAudioHash(buffer.getChannelData(0)).then((audioHash) =>
           setAudioHash(stored.id, audioHash),
-        );
+        ).catch(error => setNotice(`Audio fingerprint failed: ${String(error)}`));
         decodedRef.current.set(stored.id, buffer);
-        setTracks(await allTracks());
+        
         setSelectedId((existing) => existing ?? stored.id);
         await schedulerRef.current?.enqueue(stored.id);
       } catch (error) {
@@ -248,7 +374,7 @@ export function App() {
       setNotice(scan.error);
       return;
     }
-    setNotice(`Scanning ${scan.files.length} file(s) from ${folder}…`);
+    setNotice(`Scanning ${scan.files.length} file(s) from ${folder}Ã¢â‚¬Â¦`);
     let imported = 0;
     for (const entry of scan.files) {
       if (await trackByFilePath(entry.path)) continue;
@@ -266,7 +392,7 @@ export function App() {
 
   const togglePlay = useCallback(() => {
     if (player.playerState === "playing") player.pause();
-    else void player.play();
+    else void player.play().catch(error => setNotice(`Playback failed: ${String(error)}`));
   }, [player]);
 
   // Space toggles transport, as it does in every DJ tool.
@@ -274,7 +400,7 @@ export function App() {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))) return;
-      if (event.code === "Space") {
+      if (!event.defaultPrevented && event.code === "Space") {
         event.preventDefault();
         togglePlay();
       }
@@ -289,7 +415,7 @@ export function App() {
     if (!Number.isFinite(parsed) || parsed <= 0) return;
     try { await setManualBpm(selected.id, parsed); }
     catch (error) { setNotice(String(error)); return; }
-    setTracks(await allTracks());
+    
   }, [selected, bpmDraft]);
 
   const applyGrid = useCallback(
@@ -297,7 +423,7 @@ export function App() {
       if (!selected) return;
       try { await setManualGrid(selected.id, grid); }
       catch (error) { setNotice(String(error)); return; }
-      setTracks(await allTracks());
+      
     },
     [selected],
   );
@@ -305,23 +431,14 @@ export function App() {
   const revertGrid = useCallback(async () => {
     if (!selected) return;
     await setManualGrid(selected.id, null);
-    setTracks(await allTracks());
+    
   }, [selected]);
 
   const revertBpm = useCallback(async () => {
     if (!selected) return;
     await setManualBpm(selected.id, null);
-    setTracks(await allTracks());
+    
   }, [selected]);
-
-  const visibleTracks = useMemo(() => {
-    const needle = query.trim().toLocaleLowerCase();
-    const rows = tracks.filter(t =>
-      `${t.name} ${t.tags.artist ?? ""} ${t.tags.title ?? ""} ${t.tags.album ?? ""}`.toLocaleLowerCase().includes(needle) &&
-      (filter === "all" || (filter === "review" ? needsReview(t) : filter === "failed" ? !!t.analysisError : t.reviewedAt !== null)));
-    return rows.sort((a, b) => sort === "name" ? displayName(a.tags, a.name).localeCompare(displayName(b.tags, b.name)) :
-      sort === "bpm" ? (effectiveBpm(a) ?? 0) - (effectiveBpm(b) ?? 0) : b.addedAt - a.addedAt);
-  }, [tracks, query, filter, sort]);
 
   const [recentIds, setRecentIds] = useState<string[]>([]);
   useEffect(() => {
@@ -333,11 +450,32 @@ export function App() {
     [selected, tracks, recentIds],
   );
 
+  const [audition, setAudition] = useState<AuditionPayload | null>(null);
+
+  const livePhrases = useMemo(() => {
+    if (!selected || !activeGrid.grid) return selected?.analysis?.phrases ?? null;
+    return estimatePhrases(activeGrid.grid, selected.durationSec, selected.analysis?.energy?.curve);
+  }, [selected, activeGrid]);
+
+  const liveBars = useMemo(() => {
+    if (!selected || !activeGrid.grid || !selected.analysis?.energy?.curve) {
+      return selected?.analysis?.structure?.bars ?? [];
+    }
+    return barsFromGrid(selected.analysis.energy.curve, activeGrid.grid, selected.durationSec);
+  }, [selected, activeGrid]);
+
+  const libraryEnergy = useMemo(() => {
+    const raw = selected?.analysis?.energy?.rawScore;
+    if (raw === undefined) return null;
+    const scores = tracks
+      .map((track) => track.analysis?.energy?.rawScore)
+      .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+    return libraryEnergyDisplay(raw, scores);
+  }, [selected, tracks]);
+
   const key = selected ? effectiveKey(selected) : null;
   const job = selectedId ? jobs[selectedId] : undefined;
-  const staleCount = tracks.filter(
-    (t) => t.analysis !== null && (t.analysisVersion ?? 0) < ANALYSIS_VERSION,
-  ).length;
+  const staleCount = stats.stale;
 
   return (
     <div
@@ -348,29 +486,40 @@ export function App() {
         if (e.dataTransfer.files.length) void addFiles(e.dataTransfer.files);
       }}
     >
-      <header>
-        <h1>Music Editor</h1>
+      <header className="app-header">
+        <div className="app-brand">
+          <span className="app-brand-mark" aria-hidden="true" />
+          <h1>Music Editor</h1>
+        </div>
         <div className="head-right">
-          {staleCount > 0 && <span className="conf amber">{staleCount} stale</span>}
-          <span className="muted">{tracks.length} tracks</span>
+          <span
+            className={`svc-pill ${splitterUp ? "up" : splitterUp === false ? "down" : ""}`}
+            title="Stem splitter on :8787, shared by Studio and the editor"
+          >
+            <span className="svc-dot" />
+            Splitter {splitterUp ? "online" : splitterUp === false ? "offline" : "…"}
+          </span>
+          {view === "library" && staleCount > 0 && <span className="conf amber">{staleCount} stale</span>}
           <div className="views">
-            {(["library", "mix", "duplicates"] as const).map((v) => (
+            {(["studio", "library", "mix", "duplicates"] as const)
+            .filter((v) => v === "studio" || v === "library" || (v === "mix" && featureMixMode) || (v === "duplicates" && featureDuplicates))
+            .map((v) => (
               <button
                 key={v}
                 className={view === v ? "ghost active" : "ghost"}
                 onClick={() => setView(v)}
               >
-                {v === "library" ? "Library" : v === "mix" ? "Mix" : "Duplicates"}
+                {v === "studio" ? "Studio" : v === "library" ? "Library" : v === "mix" ? "Mix" : "Duplicates"}
               </button>
             ))}
           </div>
           {/* Desktop only: a browser cannot read a folder by path. */}
-          {isDesktop() && (
+          {view === "library" && isDesktop() && (
             <button className="import" onClick={() => void importFolder()}>
               Import folder
             </button>
           )}
-          <label className="import">
+          <label className="import" style={view === "library" ? undefined : { display: "none" }}>
             Add audio
             <input
               type="file"
@@ -385,26 +534,69 @@ export function App() {
         </div>
       </header>
 
-      <div className="transport">
-        <input aria-label="Search library" placeholder="Search title, artist, album or filename" value={query} onChange={e => setQuery(e.target.value)} />
-        <select aria-label="Filter library" value={filter} onChange={e => setFilter(e.target.value)}>
+      {view === "studio" && (
+        // Same origin as this page, so the original app keeps its saved data
+        // and talks to the same stem splitter on :8787.
+        <iframe className="studio-frame" src="./studio/index.html" title="Studio" />
+      )}
+
+      <div className="transport toolbar" style={view === "library" ? undefined : { display: "none" }}>
+        <div className="toolbar-row">
+          <div className="search-field">
+          <span className="search-field-icon" aria-hidden="true" />
+          <input aria-label="Search library" placeholder="Search title, artist, album or filename" value={query} onChange={e => { setQuery(e.target.value); setPage(0); }} />
+        </div>
+          <select aria-label="Filter library" value={filter} onChange={e => { setFilter(e.target.value); setPage(0); }}>
           <option value="all">All tracks</option><option value="review">Needs verification</option>
           <option value="failed">Failed analysis</option><option value="reviewed">Reviewed</option>
         </select>
-        <select aria-label="Sort library" value={sort} onChange={e => setSort(e.target.value)}>
+          <select aria-label="Sort library" value={sort} onChange={e => { setSort(e.target.value); setPage(0); }}>
           <option value="added">Newest first</option><option value="name">Name</option><option value="bpm">BPM</option>
         </select>
-        <label className="import">Add folder<input type="file" multiple
+        </div>
+        <div className="toolbar-row toolbar-row-secondary">
+          <span className="toolbar-meta">{libraryPage.total ? libraryPage.offset + 1 : 0}-{libraryPage.offset + visibleTracks.length} of {libraryPage.total} matches</span>
+          <button disabled={libraryPage.offset === 0} onClick={() => setPage(Math.max(0, libraryPage.offset / 100 - 1))}>Previous page</button>
+          <button disabled={libraryPage.offset + 100 >= libraryPage.total} onClick={() => setPage(libraryPage.offset / 100 + 1)}>Next page</button>
+          <label className="import">Add folder<input type="file" multiple
           ref={input => { input?.setAttribute("webkitdirectory", ""); }}
           onChange={e => { if (e.target.files) void addFiles(Array.from(e.target.files).filter(f => /\.(mp3|wav|flac|aiff?|m4a|aac|ogg|opus)$/i.test(f.name))); e.target.value = ""; }} /></label>
-        <span>{visibleTracks.length} shown</span>
+          {staleCount > 0 && <button onClick={async () => {
+          try { for (const id of await db.catalogKeys.where("stale").equals(1).primaryKeys()) await schedulerRef.current?.enqueue(id, -1); }
+          catch (error) { setNotice(String(error)); }
+        }}>Queue stale analyses ({staleCount})</button>}
+        </div>
       </div>
-      {notice && <p role="alert" className="error">{notice} <button onClick={() => setNotice("")}>Dismiss</button></p>}
-      {view === "mix" && (
+      <div className="notice-stack" aria-live="polite">
+        {notice && (
+          <p role="alert" className="notice alert">
+            {notice}
+            <button type="button" onClick={() => setNotice("")}>Dismiss</button>
+          </p>
+        )}
+        {!stats.complete && stats.total > 0 && (
+          <p role="status" className="notice info">
+            Preparing library index: {stats.indexed} of {stats.total} tracks. Search results will expand as indexing completes.
+          </p>
+        )}
+        {libraryLoading && (
+          <p role="status" className="notice info">Searching the library…</p>
+        )}
+      </div>
+      {view !== "studio" && <JobsPanel jobs={storedJobs}
+        onCancel={id => { void schedulerRef.current?.cancel(id).catch(error => setNotice(String(error))); }}
+        onRetry={id => { void schedulerRef.current?.enqueue(id, 1).catch(error => setNotice(String(error))); }} />}
+      {view === "mix" && featureMixMode && (
         <MixMode
           tracks={tracks}
           decoded={decodedRef.current}
+          audition={audition}
           onNeedDecode={async (track) => {
+            // Short-track PCM path only. Oversized tracks load via MixMode
+            // deck.loadStream (MediaElement) Ã¢â‚¬â€ never decode them here.
+            if (shouldStream(track)) {
+              throw new Error("Mix Mode streaming path should load this track without full PCM decode");
+            }
             // Mix Mode shares the editor's decode cache so a track loaded on a
             // deck is not decoded a second time.
             const cached = decodedRef.current.get(track.id);
@@ -422,54 +614,85 @@ export function App() {
         />
       )}
 
-      {view === "duplicates" && (
+      {view === "duplicates" && featureDuplicates && (
         <div className="inspector">
           <DuplicatesPanel
             tracks={tracks}
-            onChanged={() => void allTracks().then(setTracks)}
+            onChanged={() => {}}
           />
         </div>
       )}
 
-      <div className="body" style={view === "library" ? undefined : { display: "none" }}>
-        <ul className="library">
-          {tracks.length === 0 && <li className="empty">Drop audio files here</li>}
-          {visibleTracks.map((track) => {
-            const running = jobs[track.id];
-            const bpm = effectiveBpm(track);
-            const trackKey = effectiveKey(track);
-            return (
-              <li
-                key={track.id}
-                className={track.id === selectedId ? "row selected" : "row"}
-                onClick={() => setSelectedId(track.id)}
-              >
-                <span className="name">{displayName(track.tags, track.name)}</span>
-                <span className="meta">
-                  {track.analysisError ? (
-                    <span className="conf red">failed</span>
-                  ) : running ? (
-                    <span>
-                      {running.stage} {Math.round(running.progress * 100)}%
-                    </span>
-                  ) : (
-                    <>
-                      <span>
-                        {bpm !== null ? `${bpm.toFixed(1)} BPM` : "—"}
-                        {bpmIsManual(track) && <em className="manual"> manual</em>}
-                      </span>
-                      <span>{trackKey ? camelotLabel(trackKey.tonic, trackKey.mode) : "—"}</span>
-                      <span>{formatTime(track.durationSec)}</span>
-                    </>
+      <div className={`body${!selected && !stats.total ? " body-empty" : ""}`} style={view === "library" ? undefined : { display: "none" }}>
+        <div className="library-pane">
+          <div className="library-pane-head"><h2>Library</h2><span className="muted library-count">{stats.total} tracks</span></div>
+        <LibraryList tracks={visibleTracks} selectedId={selectedId} onSelect={setSelectedId} jobs={jobs}
+          offset={libraryPage.offset} total={libraryPage.total} resetKey={JSON.stringify([query, filter, sort, libraryPage.offset])}
+          emptyMessage={activePlaylistId ? "Playlist is empty or tracks are missing" : stats.total ? "No matching tracks" : "Drop audio files here"}
+
+          emptyState={
+            <div className="empty-state">
+              <p className="empty-state-title">{activePlaylistId ? "Playlist is empty" : stats.total ? "No matching tracks" : "No tracks yet"}</p>
+              <p className="empty-state-sub">
+                {activePlaylistId
+                  ? "This playlist has no tracks, or its files are missing."
+                  : stats.total
+                    ? "Try a different search or clear filters."
+                    : "Import a folder or add audio files to build your library."}
+              </p>
+              {!activePlaylistId && !stats.total && (
+                <div className="empty-state-actions">
+                  {isDesktop() && (
+                    <button type="button" className="primary" onClick={() => void importFolder()}>Import folder</button>
                   )}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
+                  <label className="import primary-like">
+                    Add audio
+                    <input type="file" accept="audio/*" multiple onChange={e => {
+                      if (e.target.files?.length) void addFiles(e.target.files);
+                      e.target.value = "";
+                    }} />
+                  </label>
+                </div>
+              )}
+            </div>
+          }
+        />
+        </div>
 
         <section className="inspector">
-          {!selected && <p className="empty">Select a track</p>}
+          {!selected && (
+            <>
+              <div className="empty-state inspector-empty">
+                <p className="empty-state-title">No track selected</p>
+                <p className="empty-state-sub">
+                  Choose a track in the library to inspect, play, and monitor mastering.
+                </p>
+                <p className="muted mastering-collapsed-hint">Select a track to monitor mastering</p>
+                {!stats.total && (
+                  <div className="empty-state-actions">
+                    {isDesktop() && (
+                      <button type="button" className="primary" onClick={() => void importFolder()}>Import folder</button>
+                    )}
+                    <label className="import primary-like">
+                      Add audio
+                      <input type="file" accept="audio/*" multiple onChange={e => {
+                        if (e.target.files?.length) void addFiles(e.target.files);
+                        e.target.value = "";
+                      }} />
+                    </label>
+                  </div>
+                )}
+              </div>
+<MissingFilesPanel />
+              <PlaylistsPanel
+                selectedTrackId={selectedId}
+                activePlaylistId={activePlaylistId}
+                onOpenPlaylist={setActivePlaylistId}
+                onNotice={setNotice}
+              />
+              <SettingsPanel />
+            </>
+          )}
           {selected && (
             <>
               <div className="title-row">
@@ -477,11 +700,13 @@ export function App() {
                 <button
                   className="ghost"
                   onClick={async () => {
-                    await schedulerRef.current?.cancel(selected.id);
-                    await removeTrack(selected.id);
-                    decodedRef.current.delete(selected.id);
-                    setSelectedId(null);
-                    setTracks(await allTracks());
+                    try {
+                      await schedulerRef.current?.cancel(selected.id);
+                      await removeTrack(selected.id);
+                      decodedRef.current.delete(selected.id);
+                      setSelectedId(null);
+                    } catch (error) { setNotice(String(error)); }
+                    
                   }}
                 >
                   Remove
@@ -493,11 +718,13 @@ export function App() {
               {peaks && (
                 <WaveformView
                   peaks={peaks}
+                  pyramidLevels={pyramidLevels}
                   durationSec={selected.durationSec}
                   beats={beats}
                   firstDownbeatSec={activeGrid.grid?.firstDownbeatSec ?? null}
                   beatsPerBar={activeGrid.grid?.beatsPerBar ?? 4}
                   positionSec={position}
+                  phraseStarts={livePhrases?.phrases.map((phrase) => phrase.startSec)}
                   onSeek={(s) => player.seek(s)}
                 />
               )}
@@ -536,6 +763,13 @@ export function App() {
                   />
                 </label>
               </div>
+              {streamingPlayback && (
+                <p className="notice warn" role="status">
+                  Long file: streaming playback (bounded memory). Beat click is audition-only, not sample-accurate.
+                </p>
+              )}
+
+              <MasteringPanel bus={player.mastering} compact />
 
               <div className="transport">
                 <button disabled={!!job} onClick={() => {
@@ -545,7 +779,7 @@ export function App() {
               </div>
               {job && (
                 <p className="muted">
-                  Analysing — {job.stage} {Math.round(job.progress * 100)}%
+                  Analysing Ã¢â‚¬â€ {job.stage} {Math.round(job.progress * 100)}%
                 </p>
               )}
 
@@ -585,7 +819,7 @@ export function App() {
                   <dt>Key</dt>
                   <dd>
                     <span className="value">
-                      {key && `${keyName(key.tonic, key.mode)} · ${camelotLabel(key.tonic, key.mode)} · ${openKeyLabel(key.tonic, key.mode)}`}
+                      {key && `${keyName(key.tonic, key.mode)} Ã‚Â· ${camelotLabel(key.tonic, key.mode)} Ã‚Â· ${openKeyLabel(key.tonic, key.mode)}`}
                     </span>
                     <span className={confidenceClass(selected.analysis.key.confidence)}>
                       {(selected.analysis.key.confidence * 100).toFixed(0)}%
@@ -605,8 +839,8 @@ export function App() {
                   <dt>Grid</dt>
                   <dd>
                     <span className="value">
-                      {selected.analysis.grid.isFixed ? "fixed" : "dynamic"} ·{" "}
-                      {selected.analysis.grid.anchors.length} anchor(s) · offset{" "}
+                      {selected.analysis.grid.isFixed ? "fixed" : "dynamic"} Ã‚Â·{" "}
+                      {selected.analysis.grid.anchors.length} anchor(s) Ã‚Â· offset{" "}
                       {(selected.analysis.gridOffsetSec * 1000).toFixed(0)} ms
                     </span>
                     <span className={confidenceClass(selected.analysis.grid.gridConfidence)}>
@@ -618,7 +852,7 @@ export function App() {
                   <dd>
                     <span className="value">
                       {!selected.analysis.loudness ? "Reanalyse to measure loudness" : Number.isFinite(selected.analysis.loudness.integratedLufs)
-                        ? `${selected.analysis.loudness.integratedLufs.toFixed(1)} LUFS · range ${selected.analysis.loudness.rangeLu.toFixed(1)} LU · peak ${selected.analysis.loudness.samplePeakDbfs.toFixed(1)} dBFS ? true peak ${selected.analysis.loudness.truePeakDbtp.toFixed(1)} dBTP`
+                        ? `${selected.analysis.loudness.integratedLufs.toFixed(1)} LUFS Ã‚Â· range ${selected.analysis.loudness.rangeLu.toFixed(1)} LU Ã‚Â· peak ${selected.analysis.loudness.samplePeakDbfs.toFixed(1)} dBFS ? true peak ${selected.analysis.loudness.truePeakDbtp.toFixed(1)} dBTP`
                         : "silent"}
                     </span>
                   </dd>
@@ -626,6 +860,18 @@ export function App() {
                   <dt>Energy</dt>
                   <dd>
                     <span className="value">{selected.analysis.energy ? `${selected.analysis.energy.level} / 10` : "Reanalyse to measure energy"}</span>
+                    {libraryEnergy?.displayLevel !== null && libraryEnergy?.displayLevel !== undefined && (
+                      <span className="muted">
+                        library {libraryEnergy.displayLevel} / 10
+                        {libraryEnergy.percentile !== null ? ` (${Math.round(libraryEnergy.percentile * 100)}th of ${libraryEnergy.sampleSize})` : ""}
+                      </span>
+                    )}
+                    {selected.analysis.keySupport && (
+                      <span className="muted">
+                        bass chroma {selected.analysis.keySupport.bassName}
+                        {selected.analysis.keySupport.agreed ? " agrees" : " differs"} (heuristic)
+                      </span>
+                    )}
                     <span className={confidenceClass(selected.analysis.energy?.confidence ?? 0)}>
                       {((selected.analysis.energy?.confidence ?? 0) * 100).toFixed(0)}%
                     </span>
@@ -633,7 +879,7 @@ export function App() {
                       {selected.analysis.energy?.contributions
                         .slice(0, 3)
                         .map((c) => `${c.name} ${(c.normalised * 100).toFixed(0)}%`)
-                        .join(" · ")}
+                        .join(" Ã‚Â· ")}
                     </span>
                   </dd>
 
@@ -648,7 +894,7 @@ export function App() {
                         selected.tags.year?.toString(),
                       ]
                         .filter(Boolean)
-                        .join(" · ") || selected.name}
+                        .join(" Ã‚Â· ") || selected.name}
                     </span>
                   </dd>
 
@@ -658,21 +904,21 @@ export function App() {
                       className="ghost small"
                       onClick={async () => {
                         await markReviewed(selected.id, selected.reviewedAt === null);
-                        setTracks(await allTracks());
+                        
                       }}
                     >
-                      {selected.reviewedAt === null ? "Mark reviewed" : "Reviewed ✓"}
+                      {selected.reviewedAt === null ? "Mark reviewed" : "Reviewed Ã¢Å“â€œ"}
                     </button>
                     <span className="muted">
                       analysis v{selected.analysis.analysisVersion}
-                      {(selected.analysisVersion ?? 0) < ANALYSIS_VERSION && " · stale"}
+                      {(selected.analysisVersion ?? 0) < ANALYSIS_VERSION && " Ã‚Â· stale"}
                     </span>
                   </dd>
                 </dl>
               )}
 
               {activeGrid.grid && <label className="toggle"><input type="checkbox" checked={!!selected.gridLocked}
-                onChange={async e => { await setGridLocked(selected.id, e.target.checked); setTracks(await allTracks()); }} />Lock grid</label>}
+                onChange={async e => { await setGridLocked(selected.id, e.target.checked);  }} />Lock grid</label>}
               {activeGrid.grid && (
                 <fieldset disabled={!!selected.gridLocked}><GridEditor
                   key={selected.id}
@@ -692,38 +938,48 @@ export function App() {
                   onChange={async e => {
                     const [tonic, mode] = e.target.value.split(":");
                     await setManualKey(selected.id, Number(tonic), mode as "major" | "minor");
-                    setTracks(await allTracks());
+                    
                   }}>
                   <option value="" disabled>Choose key</option>
                   {Array.from({ length: 12 }, (_, tonic) => ["major", "minor"].map(mode =>
                     <option key={`${tonic}:${mode}`} value={`${tonic}:${mode}`}>{keyName(tonic, mode as "major" | "minor")}</option>))}
                 </select></label>
-                <button onClick={async () => { await setManualKey(selected.id, null, null); setTracks(await allTracks()); }}>Revert key</button>
+                <button onClick={async () => { await setManualKey(selected.id, null, null);  }}>Revert key</button>
               </div>
               <div className="grid-editor">
                 <h3>Cues</h3>
                 <input aria-label="Cue name" placeholder="Cue name" value={cueName} onChange={e => setCueName(e.target.value)} />
                 <button onClick={async () => {
-                  try { await addCue(selected.id, position, cueName); setCueName(""); setTracks(await allTracks()); }
+                  try { await addCue(selected.id, position, cueName); setCueName("");  }
                   catch (error) { setNotice(String(error)); }
                 }}>Add cue at playhead</button>
                 {(selected.cues ?? []).map(cue => <div key={cue.id} className="transport">
                   <button onClick={() => player.seek(cue.timeSec)}>{cue.name} - {formatTime(cue.timeSec)}</button>
-                  <button aria-label={`Remove cue ${cue.name}`} onClick={async () => { await removeCue(selected.id, cue.id); setTracks(await allTracks()); }}>Remove cue</button>
+                  <button aria-label={`Remove cue ${cue.name}`} onClick={async () => { await removeCue(selected.id, cue.id);  }}>Remove cue</button>
                 </div>)}
               </div>
-              {selected.analysis?.structure && <div className="grid-editor"><h3>Energy and section suggestions</h3>
+              {(selected.analysis?.structure || liveBars.length > 0) && <div className="grid-editor"><h3>Energy, phrases and section suggestions</h3>
                 <p className="muted">
-                  Bar energy with rule-based section labels. Boundaries come from
-                  energy change on bar lines; labels are heuristics over energy and
-                  vocal activity, not a model of song form.
+                  Bar energy follows the effective (locked/manual) grid. Phrase
+                  labels are 8/16/32-bar estimates on that grid, not a labelled
+                  corpus. Section names stay rule-based energy/vocal heuristics.
                 </p>
                 <svg viewBox="0 0 600 80" width="100%" height="80" role="img" aria-label="Energy per bar">
-                  {selected.analysis.structure.bars.map((bar, i, bars) => <rect key={i} x={i / bars.length * 600} y={80 * (1 - bar.energy)} width={600 / bars.length} height={80 * bar.energy} fill="#3f7d8c" />)}
+                  {liveBars.map((bar, i, bars) => <rect key={i} x={i / bars.length * 600} y={80 * (1 - bar.energy)} width={600 / bars.length} height={80 * bar.energy} fill="#3f7d8c" />)}
                 </svg>
-                {selected.analysis.structure.sections.map(section => <div key={section.startSec} className="transport">
+                {livePhrases && livePhrases.phrases.length > 0 && (
+                  <div className="transport">
+                    {livePhrases.phrases.map((phrase, i) => (
+                      <button key={`${phrase.startSec}-${i}`} onClick={() => player.seek(phrase.startSec)}>
+                        P{i + 1} {livePhrases.lengthBars} bars: {formatTime(phrase.startSec)}
+                      </button>
+                    ))}
+                    <span className="muted">{Math.round(livePhrases.confidence * 100)}% phrase fit (heuristic)</span>
+                  </div>
+                )}
+                {selected.analysis?.structure?.sections.map(section => <div key={section.startSec} className="transport">
                   <button onClick={() => player.seek(section.startSec)}>{section.label}: {formatTime(section.startSec)}</button>
-                  <button onClick={async () => { await addCue(selected.id, section.startSec, section.label); setTracks(await allTracks()); }}>Save as cue</button>
+                  <button onClick={async () => { await addCue(selected.id, section.startSec, section.label);  }}>Save as cue</button>
                 </div>)}
               </div>}
               {key && <PianoVerifier context={player.audioContext} tonic={key.tonic} mode={key.mode} />}
@@ -770,6 +1026,29 @@ export function App() {
                       >
                         Skip
                       </button>
+                      {featureMixMode && <button
+                        className="ghost small"
+                        title="Preview a short synced crossfade in Mix Mode"
+                        onClick={async () => {
+                          const payload = buildAuditionPayload(selected, item, rank);
+                          if (!payload) {
+                            setNotice("Cannot audition: both tracks need an effective tempo and duration");
+                            return;
+                          }
+                          await logFeedback({
+                            fromTrackId: payload.fromTrackId,
+                            toTrackId: payload.toTrackId,
+                            action: "played",
+                            predictedScore: payload.predictedScore,
+                            rank: payload.rank,
+                          });
+                          setRecentIds(await recentlyPlayed());
+                          setAudition(payload);
+                          setView("mix");
+                        }}
+                      >
+                        Audition
+                      </button>}
                     </div>
                     <div className="rec-reasons">
                       {item.reasons.map(reason => (
@@ -784,11 +1063,17 @@ export function App() {
                   </div>
                 ))}
               </div>
-              <StemsPanel track={selected} />
+              {featureStems && <StemsPanel track={selected}
+                onQueue={async options => { await schedulerRef.current?.enqueueStems(selected.id, options); }}
+                onCancel={async () => { await schedulerRef.current?.cancel(`stems:${selected.id}`); }} />}
 
+              <FileLocationPanel track={selected} />
+              <MissingFilesPanel />
               <TagWritePanel track={selected} filePath={selected.filePath ?? null} />
+              <SettingsPanel />
 
-              <ExportPanel tracks={visibleTracks} />
+              <AnalysisHistory trackId={selected.id} />
+              <ExportPanel query={query} filter={filter} sort={sort} />
             </>
           )}
         </section>

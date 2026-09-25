@@ -1,0 +1,1 @@
+{"version":"2.1.9","results":[[":app/src/analysis/scheduler.leases.test.ts",{"duration":489.45799999999986,"failed":false}],[":app/src/analysis/scheduler.test.ts",{"duration":400.40800000000013,"failed":false}],[":app/src/db/migration.test.ts",{"duration":26.464499999999816,"failed":false}]]}

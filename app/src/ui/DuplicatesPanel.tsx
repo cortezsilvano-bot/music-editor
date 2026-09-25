@@ -1,3 +1,4 @@
+import type { CatalogTrack } from "../db/catalog";
 /**
  * Duplicate review (research Phase N).
  *
@@ -5,7 +6,7 @@
  * one explicit click per track, and the suggested keeper is only a suggestion -
  * the comparison table is there so the decision is the user's.
  */
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   findDuplicateGroups,
   planMerge,
@@ -14,12 +15,12 @@ import {
   type MergeableEdits,
   type QualityFacts,
 } from "../analysis/fingerprint";
-import { applyMerge, effectiveBpm, removeTrack, type StoredTrack } from "../db/library";
+import { db, applyMerge, effectiveBpm, removeTrack } from "../db/library";
 import type { BeatGrid } from "../dsp/beats";
 import { displayName } from "../metadata/tags";
 
 interface Props {
-  tracks: StoredTrack[];
+  tracks: CatalogTrack[];
   onChanged: () => void;
 }
 
@@ -29,7 +30,7 @@ const LEVEL_LABEL: Record<DuplicateGroup["level"], string> = {
   "similar-audio": "Likely same recording",
 };
 
-function manualEditCount(track: StoredTrack): number {
+function manualEditCount(track: CatalogTrack): number {
   let count = 0;
   if (track.manualBpm !== null) count++;
   if (track.manualGrid) count++;
@@ -38,7 +39,7 @@ function manualEditCount(track: StoredTrack): number {
   return count;
 }
 
-function toFacts(track: StoredTrack): QualityFacts {
+function toFacts(track: CatalogTrack): QualityFacts {
   return {
     id: track.id,
     bitrateKbps: track.tags.bitrateKbps,
@@ -50,7 +51,7 @@ function toFacts(track: StoredTrack): QualityFacts {
   };
 }
 
-function toEdits(track: StoredTrack): MergeableEdits {
+function toEdits(track: CatalogTrack): MergeableEdits {
   return {
     manualBpm: track.manualBpm,
     manualKeyTonic: track.manualKeyTonic,
@@ -68,7 +69,7 @@ function formatSize(bytes: number): string {
 }
 
 /** One-line description of what a merge would actually move. */
-function mergeSummary(keeper: StoredTrack, donor: StoredTrack): string {
+function mergeSummary(keeper: CatalogTrack, donor: CatalogTrack): string {
   const plan = planMerge(toEdits(keeper), toEdits(donor));
   const parts = [...plan.fields];
   if (plan.cues.length > 0) parts.push(`${plan.cues.length} cue(s)`);
@@ -77,6 +78,24 @@ function mergeSummary(keeper: StoredTrack, donor: StoredTrack): string {
 
 export function DuplicatesPanel({ tracks, onChanged }: Props) {
   const [scanned, setScanned] = useState(false);
+  const [fingerprints, setFingerprints] = useState(new Map<string, Uint32Array>());
+  const [scanning, setScanning] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => { setScanned(false); setFingerprints(new Map()); }, [tracks]);
+  useEffect(() => {
+    if (!scanning) return;
+    let cancelled = false;
+    void (async () => {
+      const loaded = new Map<string, Uint32Array>();
+      const ids = tracks.filter(track => track.hasFingerprint).map(track => track.id);
+      for (let start = 0; start < ids.length && !cancelled; start += 50) {
+        const rows = await db.tracks.bulkGet(ids.slice(start, start + 50));
+        for (const row of rows) if (row?.fingerprint) loaded.set(row.id, new Uint32Array(row.fingerprint));
+      }
+      if (!cancelled) { setFingerprints(loaded); setScanned(true); setScanning(false); }
+    })().catch(reason => { if (!cancelled) { setError(String(reason)); setScanning(false); } });
+    return () => { cancelled = true; };
+  }, [scanning, tracks]);
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const byId = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks]);
@@ -88,10 +107,10 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
         id: t.id,
         contentHash: t.contentHash,
         audioHash: t.audioHash,
-        fingerprint: t.fingerprint ? new Uint32Array(t.fingerprint) : undefined,
+        fingerprint: fingerprints.get(t.id),
       })),
     );
-  }, [tracks, scanned]);
+  }, [tracks, scanned, fingerprints]);
 
   /**
    * Move the donor's hand-made work onto the keeper before removing it.
@@ -100,7 +119,7 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
    * cue points, which is the most expensive thing in the library to redo.
    */
   const mergeAndRemove = useCallback(
-    async (keeper: StoredTrack, donor: StoredTrack) => {
+    async (keeper: CatalogTrack, donor: CatalogTrack) => {
       setBusyId(donor.id);
       try {
         const plan = planMerge(toEdits(keeper), toEdits(donor));
@@ -112,6 +131,8 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
         }
         await removeTrack(donor.id);
         onChanged();
+      } catch (reason) {
+        setError(String(reason));
       } finally {
         setBusyId(null);
       }
@@ -125,6 +146,8 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
       try {
         await removeTrack(id);
         onChanged();
+      } catch (reason) {
+        setError(String(reason));
       } finally {
         setBusyId(null);
       }
@@ -132,15 +155,16 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
     [onChanged],
   );
 
-  const withFingerprints = tracks.filter((t) => t.fingerprint).length;
+  const withFingerprints = tracks.filter((t) => t.hasFingerprint).length;
 
   return (
     <div className="export-panel">
       <h3>Duplicates</h3>
+      {error && <p role="alert">{error}</p>}
 
       <div className="ge-row">
-        <button className="ghost small" onClick={() => setScanned(true)}>
-          Scan {tracks.length} tracks
+        <button className="ghost small" disabled={scanning} onClick={() => { setError(""); setScanned(false); setScanning(true); }}>
+          {scanning ? "Loading fingerprints..." : `Scan ${tracks.length} tracks`}
         </button>
         <span className="muted">
           {withFingerprints} of {tracks.length} fingerprinted
@@ -153,7 +177,7 @@ export function DuplicatesPanel({ tracks, onChanged }: Props) {
       {groups.map((group, index) => {
         const members = group.members
           .map((m) => byId.get(m.id))
-          .filter((t): t is StoredTrack => t !== undefined);
+          .filter((t): t is CatalogTrack => t !== undefined);
         if (members.length < 2) return null;
         const ranked = rankCopies(members.map(toFacts));
         const keeperId = ranked[0]?.id;

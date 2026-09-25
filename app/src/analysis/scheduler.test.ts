@@ -6,7 +6,7 @@ import { AnalysisScheduler, type AnalysisRunner } from "./scheduler";
 import type { AnalysisResult } from "./pipeline";
 let scheduler: AnalysisScheduler;
 beforeEach(async () => { await db.jobs.clear(); await db.tracks.clear(); });
-afterEach(() => { scheduler?.dispose(); });
+afterEach(async () => { await scheduler?.dispose(); });
 async function track() { return addTrack(new File(["audio"], "track.wav"), 10, new Float32Array([1])); }
 function blockedRunner() {
   const cancel = vi.fn();
@@ -50,7 +50,7 @@ it("records a worker failure and allows a retry", async () => {
 });
 it("times out a hung computation and terminates it", async () => {
   const t = await track(); const { runner, cancel } = blockedRunner();
-  scheduler = new AnalysisScheduler(runner, () => {}, () => {}, db, 20);
+  scheduler = new AnalysisScheduler(runner, () => {}, () => {}, db, 20, { maxAttempts: 1 });
   await scheduler.start(); await scheduler.enqueue(t.id);
   await vi.waitFor(async () => expect((await db.jobs.get(t.id))?.status).toBe("failed"));
   expect((await db.tracks.get(t.id))?.analysisError).toMatch(/timed out/);

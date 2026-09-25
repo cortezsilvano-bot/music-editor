@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   camelotLabel,
+  applyKeySupport,
   detectKey,
   estimateTuningCents,
   KEY_STFT,
@@ -175,5 +176,23 @@ describe("detectKey", () => {
     const result = analyse(renderNotes([notes(C, MAJOR_TRIAD)], 1));
     const total = [...result.chroma].reduce((a, b) => a + b, 0);
     expect(total).toBeCloseTo(1, 6);
+  });
+});
+
+describe("applyKeySupport", () => {
+  it("does not replace the detected tonic or mode", () => {
+    const detected = analyse(renderNotes([notes(C, MAJOR_TRIAD)], 1.2));
+    const support = { ...detected, tonic: (detected.tonic + 1) % 12, mode: (detected.mode === "major" ? "minor" : "major") as typeof detected.mode };
+    const combined = applyKeySupport(detected, support);
+    expect(combined.tonic).toBe(detected.tonic);
+    expect(combined.mode).toBe(detected.mode);
+    expect(combined.confidence).toBeLessThanOrEqual(detected.confidence);
+  });
+
+  it("lifts confidence when bass chroma agrees", () => {
+    const detected = analyse(renderNotes([notes(C, MAJOR_TRIAD)], 1.2));
+    const combined = applyKeySupport(detected, detected);
+    expect(combined.tonic).toBe(detected.tonic);
+    expect(combined.confidence).toBeGreaterThanOrEqual(detected.confidence);
   });
 });

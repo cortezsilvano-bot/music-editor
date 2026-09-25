@@ -25,7 +25,7 @@ function stubAudioNode() {
   return {
     connect: vi.fn(),
     disconnect: vi.fn(),
-    gain: { value: 1, setValueAtTime: vi.fn(), exponentialRampToValueAtTime: vi.fn() },
+    gain: { value: 1, setValueAtTime: vi.fn(), exponentialRampToValueAtTime: vi.fn(), setTargetAtTime: vi.fn() },
     frequency: { value: 0 },
     start: vi.fn(),
     stop: vi.fn(),
@@ -40,9 +40,34 @@ class StubAudioContext {
   createGain = vi.fn(stubAudioNode);
   createOscillator = vi.fn(stubAudioNode);
   createBufferSource = vi.fn(() => ({ ...stubAudioNode(), buffer: null }));
+  createBiquadFilter = vi.fn(() => ({
+    ...stubAudioNode(),
+    type: "lowshelf",
+    frequency: { value: 0 },
+    gain: { value: 0, setTargetAtTime: vi.fn() },
+    Q: { value: 1 },
+  }));
+  createWaveShaper = vi.fn(() => ({ ...stubAudioNode(), curve: null, oversample: "none" }));
+  createDynamicsCompressor = vi.fn(() => ({
+    ...stubAudioNode(),
+    threshold: { value: -3, setTargetAtTime: vi.fn() },
+    knee: { value: 0 },
+    ratio: { value: 20 },
+    attack: { value: 0.003 },
+    release: { value: 0.1 },
+    reduction: 0,
+  }));
+  createAnalyser = vi.fn(() => ({
+    ...stubAudioNode(),
+    fftSize: 2048,
+    smoothingTimeConstant: 0.3,
+    getFloatTimeDomainData: vi.fn((buf: Float32Array) => { buf.fill(0); }),
+  }));
   decodeAudioData = vi.fn(() => Promise.reject(new Error("not used in this test")));
   resume = vi.fn(() => Promise.resolve());
   close = vi.fn(() => Promise.resolve());
+  addEventListener = vi.fn();
+  removeEventListener = vi.fn();
 }
 
 vi.stubGlobal("Worker", StubWorker);
@@ -64,13 +89,13 @@ describe("App", () => {
   it("shows the header and the import control", async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByText("Music Editor")).toBeTruthy());
-    expect(screen.getByText("Add audio")).toBeTruthy();
+    expect(screen.getAllByText("Add audio").length).toBeGreaterThan(0);
   });
 
   it("shows the empty state before any track is added", async () => {
     render(<App />);
-    await waitFor(() => expect(screen.getByText("Drop audio files here")).toBeTruthy());
-    expect(screen.getByText("Select a track")).toBeTruthy();
+    await waitFor(() => expect(screen.getByText("No tracks yet")).toBeTruthy());
+    expect(screen.getByText("No track selected")).toBeTruthy();
   });
 
   it("mounts a real file input that accepts audio", () => {

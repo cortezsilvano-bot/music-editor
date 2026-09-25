@@ -1,0 +1,133 @@
+{
+  "date": "2026-09-23T08:18:36.511Z",
+  "runtime": {
+    "node": "24.21.0",
+    "acorn": "8.18.0",
+    "ada": "4.0.0",
+    "amaro": "1.1.11",
+    "ares": "1.34.8",
+    "brotli": "1.2.0",
+    "cldr": "48.0",
+    "icu": "78.2",
+    "llhttp": "9.4.3",
+    "merve": "1.2.2",
+    "modules": "149",
+    "napi": "10",
+    "nbytes": "0.1.4",
+    "ncrypto": "0.0.1",
+    "nghttp2": "1.70.0",
+    "nghttp3": "",
+    "ngtcp2": "",
+    "openssl": "0.0.0",
+    "simdjson": "4.6.7",
+    "simdutf": "7.7.0",
+    "sqlite": "3.53.4",
+    "tz": "2025c",
+    "undici": "7.29.1",
+    "unicode": "17.0",
+    "uv": "1.52.1",
+    "uvwasi": "0.0.23",
+    "v8": "15.2.124.28-electron.0",
+    "zlib": "1.3.2.1-motley",
+    "zstd": "1.6.0",
+    "electron": "44.4.3",
+    "chrome": "152.0.7977.130"
+  },
+  "totalMemoryBytes": 68484825088,
+  "cpu": "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz",
+  "results": [
+    {
+      "count": 10000,
+      "seedMs": 5388.1,
+      "oneTimeBackfillMs": 3589.9,
+      "firstPageMs": 21.8,
+      "nextPageMs": 5.6,
+      "coldSearchMs": 138.8,
+      "search": {
+        "medianMs": 3.7,
+        "p95Ms": 4.3
+      },
+      "review": {
+        "medianMs": 4,
+        "p95Ms": 5.8
+      },
+      "namePage": {
+        "medianMs": 3.2,
+        "p95Ms": 5.2
+      },
+      "bpmPage": {
+        "medianMs": 4.3,
+        "p95Ms": 6.4
+      },
+      "lastPageMs": 90.9,
+      "queryFullTrackReads": 0,
+      "selectedDetailMs": 0.7,
+      "selectedDetailReads": 1,
+      "pageRows": 100,
+      "firstPageJsonBytes": 86281,
+      "limits": "Real Chromium IndexedDB with synthetic analysis, 2000-float peaks and 44-byte placeholder audio. First page includes reopened DB startup. Cold search reads compact keys once. Seven warm samples; p95 is the maximum. No real-media decode, DOM paint, physical audio devices or disk-cold OS cache measurement."
+    },
+    {
+      "count": 50000,
+      "seedMs": 33772.4,
+      "oneTimeBackfillMs": 25235.4,
+      "firstPageMs": 114.3,
+      "nextPageMs": 6.2,
+      "coldSearchMs": 611.8,
+      "search": {
+        "medianMs": 10.4,
+        "p95Ms": 12.2
+      },
+      "review": {
+        "medianMs": 8.5,
+        "p95Ms": 10.9
+      },
+      "namePage": {
+        "medianMs": 8.6,
+        "p95Ms": 9.2
+      },
+      "bpmPage": {
+        "medianMs": 7.8,
+        "p95Ms": 21.3
+      },
+      "lastPageMs": 545.4,
+      "queryFullTrackReads": 0,
+      "selectedDetailMs": 0.5,
+      "selectedDetailReads": 1,
+      "pageRows": 100,
+      "firstPageJsonBytes": 86606,
+      "limits": "Real Chromium IndexedDB with synthetic analysis, 2000-float peaks and 44-byte placeholder audio. First page includes reopened DB startup. Cold search reads compact keys once. Seven warm samples; p95 is the maximum. No real-media decode, DOM paint, physical audio devices or disk-cold OS cache measurement."
+    },
+    {
+      "count": 100000,
+      "seedMs": 83705.2,
+      "oneTimeBackfillMs": 51133.2,
+      "firstPageMs": 372.7,
+      "nextPageMs": 7.9,
+      "coldSearchMs": 1525,
+      "search": {
+        "medianMs": 18.6,
+        "p95Ms": 29
+      },
+      "review": {
+        "medianMs": 16.5,
+        "p95Ms": 21.6
+      },
+      "namePage": {
+        "medianMs": 14.3,
+        "p95Ms": 46.9
+      },
+      "bpmPage": {
+        "medianMs": 4.7,
+        "p95Ms": 7.4
+      },
+      "lastPageMs": 1139.6,
+      "queryFullTrackReads": 0,
+      "selectedDetailMs": 0.7,
+      "selectedDetailReads": 1,
+      "pageRows": 100,
+      "firstPageJsonBytes": 86606,
+      "limits": "Real Chromium IndexedDB with synthetic analysis, 2000-float peaks and 44-byte placeholder audio. First page includes reopened DB startup. Cold search reads compact keys once. Seven warm samples; p95 is the maximum. No real-media decode, DOM paint, physical audio devices or disk-cold OS cache measurement."
+    }
+  ]
+}

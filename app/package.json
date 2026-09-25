@@ -1,7 +1,7 @@
 {
   "name": "music-editor",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,7 +15,15 @@
     "desktop:dev": "npm run build && electron .",
     "desktop:build": "npm run build && electron-builder --win",
     "desktop:dir": "npm run build && electron-builder --win --dir",
-    "test:desktop": "npm run build && node scripts/desktop-smoke.mjs"
+    "test:desktop": "npm run build && node scripts/desktop-smoke.mjs",
+    "test:jobs": "npm run build && node scripts/job-lifecycle.mjs",
+    "benchmark:library": "npm run build && node scripts/library-benchmark.mjs",
+    "verify": "npm run lint && npm test && npm run build && node scripts/desktop-smoke.mjs && node scripts/job-lifecycle.mjs && node scripts/catalog-smoke.mjs",
+    "test:stems": "npm run build && node scripts/stems-smoke.mjs",
+    "test:server": "python -m unittest discover -s ../server -p test_*.py -v",
+    "verify:stems": "npm run verify && npm run test:server && node scripts/stems-smoke.mjs",
+    "test:catalog": "npm run build && node scripts/catalog-smoke.mjs",
+    "benchmark:catalog": "npm run build && node scripts/catalog-benchmark.mjs"
   },
   "dependencies": {
     "node-id3": "^0.2.9"
@@ -68,6 +76,37 @@
       "dist/**/*",
       "electron/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../server",
+        "to": "server",
+        "filter": [
+          "**/*",
+          "!**/__pycache__",
+          "!**/__pycache__/**",
+          "!**/.venv",
+          "!**/.venv/**",
+          "!**/.venv*/**",
+          "!**/venv",
+          "!**/venv/**",
+          "!**/jobs",
+          "!**/jobs/**",
+          "!**/.pytest_cache",
+          "!**/.pytest_cache/**",
+          "!**/checkpoints",
+          "!**/checkpoints/**",
+          "!**/weights",
+          "!**/weights/**",
+          "!**/.cache",
+          "!**/.cache/**",
+          "!**/*.pyc",
+          "!**/*.pth",
+          "!**/*.ckpt",
+          "!**/*.pt",
+          "!**/*.bin"
+        ]
+      }
     ],
     "win": {
       "target": [

@@ -16,6 +16,7 @@ this service, so CORS has to be open on the downloads as well as the upload.
 from __future__ import annotations
 
 import io
+from contextlib import asynccontextmanager
 import json
 import os
 import shutil
@@ -33,6 +34,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 import demucs_separator
 import dsp_separator
+from stem_jobs import StemJobs
 
 # Stem keys must be values the editor's track-type table knows; anything else
 # is silently coerced to "other" and loses its colour and label.
@@ -59,7 +61,17 @@ FORCE_BACKEND = os.environ.get("STEM_BACKEND", "auto").lower()
 JOBS_DIR = Path(os.environ.get("JOBS_DIR", Path(tempfile.gettempdir()) / "song-studio-stems"))
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Song Studio stem separation", version="1.0.0")
+durable_jobs = StemJobs(JOBS_DIR / "durable", retention_seconds=max(60, int(os.environ.get("STEM_RESULTS_TTL_SECONDS", "604800"))))
+
+@asynccontextmanager
+async def lifespan(_app):
+    durable_jobs.start()
+    try:
+        yield
+    finally:
+        durable_jobs.stop()
+
+app = FastAPI(title="Song Studio stem separation", version="2.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,6 +99,8 @@ def _sweep_old_jobs() -> None:
     """Drop rendered stems once the editor has had time to fetch them."""
     cutoff = time.time() - JOB_TTL_SECONDS
     for entry in JOBS_DIR.glob("*"):
+        if entry.name == "durable":
+            continue
         try:
             if entry.is_dir() and entry.stat().st_mtime < cutoff:
                 shutil.rmtree(entry, ignore_errors=True)
@@ -110,15 +124,81 @@ def _decode(raw: bytes) -> tuple[np.ndarray, int]:
 
 @app.get("/api/health")
 def health() -> dict:
-    backend = "demucs" if demucs_separator.available() else "dsp"
+    backend = _pick_backend("")
     return {
         "ok": True,
         "service": "song-studio-separation",
+        "jobProtocol": 2,
         "backend": backend,
         "demucs": demucs_separator.status(),
         "dsp": {"available": True},
         "jobs_dir": str(JOBS_DIR),
     }
+
+
+def job_response(row: dict, request: Request) -> dict:
+    response = {"id": row["id"], "status": row["status"], "attempts": row["attempts"],
+                "error": row["error"], "errorCode": row["error_code"], "updatedAt": row["updated_at"]}
+    if row["status"] == "done" and row["result"]:
+        result = json.loads(row["result"])
+        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        for stem in result["stems"]:
+            stem["url"] = f"{base}/api/studio/jobs/{row['id']}/stems/{quote(stem['file'])}"
+        response["result"] = result
+    return response
+
+
+@app.put("/api/studio/jobs/{job}")
+def submit_job(job: str, request: Request, file: UploadFile = File(...), options: str = Form("{}")):
+    raw = file.file.read(MAX_UPLOAD_BYTES + 1)
+    if not raw or len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "Upload is empty or exceeds the configured size limit")
+    try:
+        opts = json.loads(options)
+        if not isinstance(opts, dict) or opts.get("quality", "balanced") not in {"balanced", "high"} or opts.get("stems", "basic") not in {"basic", "two"}:
+            raise ValueError("Invalid separation options")
+        opts = {"backend": _pick_backend(str(opts.get("backend", ""))), "quality": opts.get("quality", "balanced"), "stems": opts.get("stems", "basic")}
+        row = durable_jobs.submit(job, raw, file.filename or "audio", opts)
+        return job_response(row, request)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@app.get("/api/studio/jobs/{job}")
+def get_job(job: str, request: Request):
+    try:
+        row = durable_jobs.get(job)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not row:
+        raise HTTPException(404, "Unknown separation job")
+    return job_response(row, request)
+
+
+@app.delete("/api/studio/jobs/{job}")
+def cancel_job(job: str, request: Request):
+    try:
+        return job_response(durable_jobs.cancel(job), request)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.get("/api/studio/jobs/{job}/stems/{name}")
+def download_job_stem(job: str, name: str):
+    try:
+        row = durable_jobs.get(job)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    if not row or row["status"] != "done":
+        raise HTTPException(404, "No completed stems")
+    result = json.loads(row["result"])
+    if name not in {stem["file"] for stem in result["stems"]} or Path(name).name != name:
+        raise HTTPException(404, "Unknown stem")
+    directory = (durable_jobs.root / job / row["attempt"]).resolve()
+    target = (directory / name).resolve()
+    if target.parent != directory or not target.is_file():
+        raise HTTPException(404, "Missing stem")
+    return FileResponse(target, media_type="audio/wav", filename=name)
 
 
 @app.post("/api/studio/separate")
@@ -127,7 +207,7 @@ def separate(
     file: UploadFile = File(...),
     options: str = Form("{}"),
 ) -> dict:
-    raw = file.file.read()
+    raw = file.file.read(MAX_UPLOAD_BYTES + 1)
     if not raw:
         raise HTTPException(400, "Empty upload.")
     if len(raw) > MAX_UPLOAD_BYTES:
@@ -197,7 +277,7 @@ def download(job: str, name: str) -> FileResponse:
     # Resolve and confirm containment; the name reaches us straight from a URL.
     job_dir = (JOBS_DIR / job).resolve()
     target = (job_dir / name).resolve()
-    if not str(target).startswith(str(JOBS_DIR.resolve())) or not target.is_file():
+    if job_dir.parent != JOBS_DIR.resolve() or target.parent != job_dir or not target.is_file():
         raise HTTPException(404, "Stem not found or expired.")
     return FileResponse(target, media_type="audio/wav", filename=name)
 

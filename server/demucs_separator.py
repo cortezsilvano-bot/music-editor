@@ -138,6 +138,7 @@ def resolve_device():
 _model = None
 _lock = threading.Lock()
 _import_error: str | None = None
+_fallback_reason: str | None = None
 
 
 def available() -> bool:
@@ -238,6 +239,7 @@ def separate(audio: np.ndarray, sr: int, quality: str = "") -> dict[str, np.ndar
         if label == "cpu":
             raise
         print(f"  {label} failed ({exc}); falling back to CPU", flush=True)
+        globals()["_fallback_reason"] = f"{label}: {type(exc).__name__}: {exc}"
         globals()["_resolved_device"] = torch.device("cpu")
         globals()["_device_label"] = "cpu"
         with torch.no_grad():

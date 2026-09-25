@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { crossfadeGains, syncRatio } from "./deck";
 
 describe("crossfadeGains", () => {
@@ -69,5 +69,124 @@ describe("syncRatio", () => {
     expect(syncRatio(0, 128)).toBe(1);
     expect(syncRatio(128, 0)).toBe(1);
     expect(syncRatio(Number.NaN, 128)).toBe(1);
+  });
+});
+
+describe("Deck.loadStream", () => {
+  function mockMediaElementSource() {
+    return { connect: vi.fn(), disconnect: vi.fn() };
+  }
+
+  function biquad() {
+    return {
+      type: "",
+      frequency: { value: 0 },
+      Q: { value: 0 },
+      gain: { value: 0, setTargetAtTime: vi.fn() },
+      connect: vi.fn(),
+    };
+  }
+
+  function gainNode() {
+    return {
+      gain: { value: 1, setTargetAtTime: vi.fn() },
+      connect: vi.fn(),
+    };
+  }
+
+  it("loads via MediaElement without posting PCM to the worklet", async () => {
+    const mediaListeners: Record<string, Array<() => void>> = {};
+    const media = {
+      preload: "",
+      paused: true,
+      currentTime: 0,
+      duration: 3600,
+      readyState: 1,
+      playbackRate: 1,
+      error: null as { message: string } | null,
+      src: "",
+      onended: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+      addEventListener: (type: string, fn: () => void) => {
+        (mediaListeners[type] ??= []).push(fn);
+      },
+      removeEventListener: (type: string, fn: () => void) => {
+        mediaListeners[type] = (mediaListeners[type] ?? []).filter((item) => item !== fn);
+      },
+      load: vi.fn(() => {
+        queueMicrotask(() => {
+          for (const fn of mediaListeners.loadedmetadata ?? []) fn();
+        });
+      }),
+      play: vi.fn(async () => {
+        media.paused = false;
+      }),
+      pause: vi.fn(() => {
+        media.paused = true;
+      }),
+      removeAttribute: vi.fn(),
+    };
+    vi.stubGlobal("Audio", vi.fn(() => media));
+    vi.stubGlobal("URL", {
+      createObjectURL: vi.fn(() => "blob:mix-stream"),
+      revokeObjectURL: vi.fn(),
+    });
+
+    const context = {
+      currentTime: 0,
+      state: "running",
+      sampleRate: 48000,
+      destination: {},
+      baseLatency: 0,
+      outputLatency: 0,
+      createBiquadFilter: vi.fn(biquad),
+      createGain: vi.fn(gainNode),
+      createDynamicsCompressor: vi.fn(() => ({
+        threshold: { value: 0 },
+        knee: { value: 0 },
+        ratio: { value: 0 },
+        attack: { value: 0 },
+        release: { value: 0 },
+        reduction: 0,
+        connect: vi.fn(),
+      })),
+      createMediaElementSource: vi.fn(mockMediaElementSource),
+      resume: vi.fn(async () => {}),
+      close: vi.fn(),
+    } as unknown as AudioContext;
+
+    const { Deck } = await import("./deck");
+    const deck = new Deck("A", context);
+    await deck.loadStream(new Blob([new Uint8Array([1, 2, 3])], { type: "audio/mpeg" }), 3600, null);
+
+    expect(deck.streaming).toBe(true);
+    expect(deck.state.loaded).toBe(true);
+    expect(deck.state.streaming).toBe(true);
+    expect(deck.state.durationSec).toBe(3600);
+
+    deck.seekSeconds(120);
+    expect(media.currentTime).toBe(120);
+    expect(deck.state.positionSec).toBe(120);
+
+    deck.setRate(1.05);
+    expect(media.playbackRate).toBe(1.05);
+
+    // PCM-only features must no-op rather than pretend to loop.
+    deck.setBeatLoop(4);
+    expect(deck.state.loop).toBeNull();
+    deck.startRoll(1);
+    expect(deck.state.loop).toBeNull();
+
+    await deck.play();
+    expect(deck.state.playing).toBe(true);
+    deck.pause();
+    expect(deck.state.playing).toBe(false);
+    expect(media.pause).toHaveBeenCalled();
+
+    deck.eject();
+    expect(deck.streaming).toBe(false);
+    expect(deck.state.loaded).toBe(false);
+
+    vi.unstubAllGlobals();
   });
 });

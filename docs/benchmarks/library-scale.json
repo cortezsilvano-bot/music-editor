@@ -1,0 +1,115 @@
+{
+  "date": "2026-09-23T04:47:04.386Z",
+  "runtime": {
+    "node": "24.21.0",
+    "acorn": "8.18.0",
+    "ada": "4.0.0",
+    "amaro": "1.1.11",
+    "ares": "1.34.8",
+    "brotli": "1.2.0",
+    "cldr": "48.0",
+    "icu": "78.2",
+    "llhttp": "9.4.3",
+    "merve": "1.2.2",
+    "modules": "149",
+    "napi": "10",
+    "nbytes": "0.1.4",
+    "ncrypto": "0.0.1",
+    "nghttp2": "1.70.0",
+    "nghttp3": "",
+    "ngtcp2": "",
+    "openssl": "0.0.0",
+    "simdjson": "4.6.7",
+    "simdutf": "7.7.0",
+    "sqlite": "3.53.4",
+    "tz": "2025c",
+    "undici": "7.29.1",
+    "unicode": "17.0",
+    "uv": "1.52.1",
+    "uvwasi": "0.0.23",
+    "v8": "15.2.124.28-electron.0",
+    "zlib": "1.3.2.1-motley",
+    "zstd": "1.6.0",
+    "electron": "44.4.3",
+    "chrome": "152.0.7977.130"
+  },
+  "totalMemoryBytes": 68484825088,
+  "cpu": "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz",
+  "results": [
+    {
+      "count": 10000,
+      "seedMs": 5900,
+      "loadAllMs": 2111.6,
+      "indexedPageMs": 17.7,
+      "search": {
+        "medianMs": 2.9,
+        "p95Ms": 3.6
+      },
+      "filter": {
+        "medianMs": 8.4,
+        "p95Ms": 15.4
+      },
+      "sortName": {
+        "medianMs": 17.3,
+        "p95Ms": 21.8
+      },
+      "sortBpm": {
+        "medianMs": 1.6,
+        "p95Ms": 2.8
+      },
+      "interactiveQueryGatePassed": true,
+      "waveformBytes": 80000000,
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    },
+    {
+      "count": 50000,
+      "seedMs": 27617.3,
+      "loadAllMs": 10858.8,
+      "indexedPageMs": 19.6,
+      "search": {
+        "medianMs": 14.2,
+        "p95Ms": 18
+      },
+      "filter": {
+        "medianMs": 29.9,
+        "p95Ms": 34
+      },
+      "sortName": {
+        "medianMs": 107.3,
+        "p95Ms": 115.9
+      },
+      "sortBpm": {
+        "medianMs": 11.3,
+        "p95Ms": 13.1
+      },
+      "interactiveQueryGatePassed": true,
+      "waveformBytes": 400000000,
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    },
+    {
+      "count": 100000,
+      "seedMs": 37033.9,
+      "loadAllMs": 22553,
+      "indexedPageMs": 1879.4,
+      "search": {
+        "medianMs": 45.9,
+        "p95Ms": 56.7
+      },
+      "filter": {
+        "medianMs": 98.2,
+        "p95Ms": 126
+      },
+      "sortName": {
+        "medianMs": 397,
+        "p95Ms": 474.2
+      },
+      "sortBpm": {
+        "medianMs": 36.9,
+        "p95Ms": 45.2
+      },
+      "interactiveQueryGatePassed": false,
+      "waveformBytes": 800000000,
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    }
+  ]
+}

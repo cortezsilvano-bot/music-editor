@@ -1,0 +1,47 @@
+{
+  "date": "2026-09-23T05:04:02.824Z",
+  "results": [
+    {
+      "count": 10000,
+      "initialCommitAndLayoutMs": 8.6,
+      "scrollCommitAndLayoutMs": [
+        21.6,
+        20.8,
+        21.7,
+        22.7
+      ],
+      "renderedRows": 13,
+      "lastTrackVisible": true,
+      "visibility": "visible",
+      "limits": "Synthetic metadata, actual LibraryList in Chromium at 320x500. DOM commit/layout with a 20ms event-settling wait per scroll, not perceived latency or paint. Hidden Electron windows throttle animation frames. Excludes database loading, analysis and audio."
+    },
+    {
+      "count": 50000,
+      "initialCommitAndLayoutMs": 2.5,
+      "scrollCommitAndLayoutMs": [
+        22.3,
+        22.1,
+        22,
+        21.2
+      ],
+      "renderedRows": 13,
+      "lastTrackVisible": true,
+      "visibility": "visible",
+      "limits": "Synthetic metadata, actual LibraryList in Chromium at 320x500. DOM commit/layout with a 20ms event-settling wait per scroll, not perceived latency or paint. Hidden Electron windows throttle animation frames. Excludes database loading, analysis and audio."
+    },
+    {
+      "count": 100000,
+      "initialCommitAndLayoutMs": 2.6,
+      "scrollCommitAndLayoutMs": [
+        21.6,
+        21.1,
+        22.6,
+        22.3
+      ],
+      "renderedRows": 13,
+      "lastTrackVisible": true,
+      "visibility": "visible",
+      "limits": "Synthetic metadata, actual LibraryList in Chromium at 320x500. DOM commit/layout with a 20ms event-settling wait per scroll, not perceived latency or paint. Hidden Electron windows throttle animation frames. Excludes database loading, analysis and audio."
+    }
+  ]
+}

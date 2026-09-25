@@ -25,6 +25,14 @@ export interface StemCacheEntry {
   audioHash: string;
   /** Engine and model that produced these, e.g. "demucs/htdemucs". */
   model: string;
+  modelVersion?: string;
+  checkpointHash?: string | null;
+  algorithmHash?: string;
+  sourceHash?: string;
+  quality?: "balanced" | "high";
+  device?: string;
+  fallbackReason?: string | null;
+  serverJobId?: string;
   trackId: string;
   trackName: string;
   stems: CachedStem[];

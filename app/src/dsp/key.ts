@@ -228,10 +228,7 @@ function correlate(chroma: Float64Array, profile: number[], rotation: number): n
   return den > 0 ? num / den : 0;
 }
 
-export function detectKey(spec: Spectrogram): KeyResult {
-  const tuningCents = estimateTuningCents(spec);
-  const chroma = computeChroma(spec, tuningCents);
-
+export function scoreKeyFromChroma(chroma: Float64Array, tuningCents: number): KeyResult {
   // Average the profiles' verdicts rather than trusting any single one.
   const scores: KeyCandidate[] = [];
   for (let tonic = 0; tonic < 12; tonic++) {
@@ -271,6 +268,34 @@ export function detectKey(spec: Spectrogram): KeyResult {
     alternates: scores.slice(1, 4),
     chroma,
   };
+}
+
+export function detectKey(spec: Spectrogram): KeyResult {
+  const tuningCents = estimateTuningCents(spec);
+  const chroma = computeChroma(spec, tuningCents);
+  return scoreKeyFromChroma(chroma, tuningCents);
+}
+
+/**
+ * Bass-chroma (or any second chroma) as a confidence aid.
+ *
+ * Never replaces the detected tonic/mode. Agreement lifts confidence slightly;
+ * disagreement is recorded as an alternate and trims confidence. Manual key
+ * overrides live on the track row and are not touched here.
+ */
+export function applyKeySupport(detected: KeyResult, support: KeyResult): KeyResult {
+  const agreed = detected.tonic === support.tonic && detected.mode === support.mode;
+  let confidence = detected.confidence;
+  if (agreed) confidence = clamp01(confidence + 0.08);
+  else if (detected.tonic === support.tonic) confidence = clamp01(confidence + 0.03);
+  else confidence = clamp01(confidence * 0.9);
+
+  const alternates = [...detected.alternates];
+  if (!agreed && !alternates.some((a) => a.tonic === support.tonic && a.mode === support.mode)) {
+    alternates.push({ tonic: support.tonic, mode: support.mode, score: support.confidence });
+    alternates.sort((a, b) => b.score - a.score);
+  }
+  return { ...detected, confidence, alternates: alternates.slice(0, 4) };
 }
 
 function clamp01(x: number): number {

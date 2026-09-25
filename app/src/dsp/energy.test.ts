@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeEnergy } from "./energy";
+import { computeEnergy, libraryEnergyDisplay, scoreEnergyFeatures } from "./energy";
 import { computeOnsetEnvelope } from "./onset";
 import { ANALYSIS_SAMPLE_RATE, computeStft } from "./spectral";
 
@@ -129,5 +129,39 @@ describe("computeEnergy", () => {
     expect(Number.isFinite(result.level)).toBe(true);
     expect(Number.isFinite(result.confidence)).toBe(true);
     expect(result.level).toBe(1);
+  });
+});
+
+describe("library energy renormalisation", () => {
+  it("exposes a rawScore that matches the weighted feature sum", () => {
+    const result = energyOf(busyTrack(12), -8);
+    expect(Number.isFinite(result.rawScore)).toBe(true);
+    expect(result.rawScore).toBeCloseTo(scoreEnergyFeatures(result.features).score, 9);
+    expect(result.level).toBe(scoreEnergyFeatures(result.features).level);
+  });
+
+  it("maps library percentiles onto a 0..10 display without rewriting features", () => {
+    const quiet = energyOf(calmTrack(12), -28);
+    const loud = energyOf(busyTrack(12), -7);
+    const featuresCopy = { ...quiet.features };
+    const scale = libraryEnergyDisplay(quiet.rawScore, [quiet.rawScore, loud.rawScore]);
+    expect(scale.sampleSize).toBe(2);
+    expect(scale.percentile).not.toBeNull();
+    expect(scale.percentile!).toBeLessThan(0.5);
+    expect(scale.displayLevel).toBeGreaterThanOrEqual(0);
+    expect(scale.displayLevel).toBeLessThanOrEqual(10);
+    expect(quiet.features).toEqual(featuresCopy);
+
+    const top = libraryEnergyDisplay(loud.rawScore, [quiet.rawScore, loud.rawScore, (quiet.rawScore + loud.rawScore) / 2]);
+    expect(top.percentile!).toBeGreaterThan(0.5);
+    expect(top.displayLevel!).toBeGreaterThan(scale.displayLevel!);
+  });
+
+  it("does not invent a library scale from a single track", () => {
+    const result = energyOf(busyTrack(10), -8);
+    const scale = libraryEnergyDisplay(result.rawScore, [result.rawScore]);
+    expect(scale.displayLevel).toBeNull();
+    expect(scale.percentile).toBeNull();
+    expect(scale.sampleSize).toBe(1);
   });
 });

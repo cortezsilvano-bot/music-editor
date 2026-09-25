@@ -21,10 +21,12 @@ server/.venv*/
 __pycache__/
 *.pyc
 
-# The original Google AI Studio export: a compiled bundle with no source, so
-# there is nothing meaningful to version.
-assets/
-index.html
+# The original Google AI Studio export at the project root: a compiled bundle
+# with no source. Anchored with a leading slash - unanchored, these patterns
+# also matched app/index.html (the app's entry page) and the embedded copy in
+# app/public/studio, which silently left both out of the repository.
+/assets/
+/index.html
 
 # Stem separation output and local caches.
 server/jobs/
@@ -39,3 +41,10 @@ desktop.ini
 
 # TypeScript incremental build cache
 *.tsbuildinfo
+
+# Tiny synthetic test tones (sine waves, a few KB) - not music, and needed by CI.
+!app/electron/fixtures/
+!app/electron/fixtures/*
+
+# Unrelated to the music editor
+_luxe-label-studio-fixed.html

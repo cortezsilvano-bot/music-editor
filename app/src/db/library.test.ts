@@ -25,6 +25,7 @@ import {
   setManualBpm,
   setManualKey,
   staleTracks,
+  persistAnalysis,
 } from "./library";
 
 function fakeAnalysis(bpm: number, tonic: number, version = 1): AnalysisResult {
@@ -65,6 +66,7 @@ function fakeAnalysis(bpm: number, tonic: number, version = 1): AnalysisResult {
     },
     energy: {
       level: 7,
+      rawScore: 0.7,
       confidence: 0.6,
       features: {
         loudnessLufs: -8.2,
@@ -88,6 +90,26 @@ function fakeAnalysis(bpm: number, tonic: number, version = 1): AnalysisResult {
 }
 
 const file = () => new File([new Uint8Array([1, 2, 3])], "t.wav", { type: "audio/wav" });
+
+it("archives prior results, rejects duplicate commits atomically and preserves corrections", async () => {
+  const track = await addTrack(file(), 120, new Float32Array([1]));
+  await db.tracks.update(track.id, { analysis: fakeAnalysis(110, 1), analysisVersion: 1,
+    manualBpm: 123, manualKeyTonic: 7, manualKeyMode: "major", gridLocked: true,
+    cues: [{ id: "cue", timeSec: 10, name: "Keep" }] });
+  await persistAnalysis(db, track.id, fakeAnalysis(130, 2), "unique-commit");
+  await expect(persistAnalysis(db, track.id, fakeAnalysis(140, 3), "unique-commit")).rejects.toThrow();
+  const stored = (await db.tracks.get(track.id))!;
+  expect(stored.analysis?.tempo.bpm).toBe(130);
+  expect(effectiveBpm(stored)).toBe(123);
+  expect(effectiveKey(stored)).toEqual({ tonic: 7, mode: "major", manual: true });
+  expect(stored.gridLocked).toBe(true);
+  expect(stored.cues?.[0].name).toBe("Keep");
+  expect(new Uint32Array(stored.fingerprint!)).toEqual(new Uint32Array([1, 2, 3]));
+  const history = await db.analysisHistory.where("trackId").equals(track.id).toArray();
+  expect(history.map(snapshot => snapshot.result.tempo.bpm).sort()).toEqual([110, 130]);
+  await removeTrack(track.id);
+  expect(await db.analysisHistory.where("trackId").equals(track.id).count()).toBe(0);
+});
 
 const tags = { ...EMPTY_TAGS, artist: "A", title: "T" };
 

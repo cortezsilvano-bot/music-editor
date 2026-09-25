@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { analyseStructure, type StructureInput } from "./structure";
+import { analyseStructure, barsFromGrid, type StructureInput } from "./structure";
 
 const grid = {
   anchors: [{ timeSec: 0, beatIndex: 0, bpm: 120 }],
@@ -111,5 +111,18 @@ describe("section labels", () => {
     const sections = analyseStructure(input(arc(), 200)).sections;
     expect(sections[0].startSec).toBe(0);
     expect(sections[sections.length - 1].endSec).toBeCloseTo(200, 6);
+  });
+});
+
+describe("barsFromGrid follows the effective grid", () => {
+  it("makes shorter bars when the locked BPM is faster", () => {
+    const curve = new Float32Array(16).fill(0.5);
+    const slow = { ...grid, anchors: [{ timeSec: 0, beatIndex: 0, bpm: 60 }] };
+    const fast = { ...grid, anchors: [{ timeSec: 0, beatIndex: 0, bpm: 120 }] };
+    const slowBars = barsFromGrid(curve, slow, 16);
+    const fastBars = barsFromGrid(curve, fast, 16);
+    expect(slowBars[0].endSec - slowBars[0].startSec).toBeCloseTo(4, 6);
+    expect(fastBars[0].endSec - fastBars[0].startSec).toBeCloseTo(2, 6);
+    expect(fastBars.length).toBeGreaterThan(slowBars.length);
   });
 });

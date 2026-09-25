@@ -41,3 +41,36 @@ it("reports a worker crash instead of leaving the job unresolved", async () => {
   FakeWorker.instances[0].onerror?.({ preventDefault: vi.fn(), message: "worker crashed" });
   await rejection; run.cancel();
 });
+it("reuses cached PCM without transferring or modifying the playback buffer", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const pcm = new Float32Array([0.25, -0.5]);
+  const buffer = { ...decoded, getChannelData: () => pcm } as unknown as AudioBuffer;
+  const decodeAudioData = vi.fn();
+  const run = workerRunner({ decodeAudioData } as unknown as BaseAudioContext, new Map([[track.id, buffer]]))(track, vi.fn());
+  await vi.waitFor(() => expect(FakeWorker.instances).toHaveLength(1));
+  expect(decodeAudioData).not.toHaveBeenCalled();
+  const [message, transfers] = FakeWorker.instances[0].postMessage.mock.calls[0];
+  expect(message.channels[0]).toEqual(pcm);
+  expect(transfers[0]).not.toBe(pcm.buffer);
+  message.channels[0][0] = 1;
+  expect(pcm[0]).toBe(0.25);
+  const rejection = expect(run.result).rejects.toThrow("cancelled");
+  run.cancel(); await rejection;
+});
+
+it("refuses oversized tracks before decoding for analysis", async () => {
+  vi.stubGlobal("Worker", FakeWorker);
+  const longTrack = {
+    id: "long",
+    durationSec: 16 * 60,
+    sizeBytes: 1024,
+    tags: { channels: 2 },
+    audio: { arrayBuffer: async () => new ArrayBuffer(4) },
+  } as StoredTrack;
+  const decodeAudioData = vi.fn();
+  const run = workerRunner({ decodeAudioData } as unknown as BaseAudioContext)(longTrack, vi.fn());
+  await expect(run.result).rejects.toThrow(/too long for full-pipeline analysis PCM/);
+  expect(decodeAudioData).not.toHaveBeenCalled();
+  expect(FakeWorker.instances).toHaveLength(0);
+  run.cancel();
+});

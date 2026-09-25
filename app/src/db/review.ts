@@ -1,3 +1,4 @@
+import { staleAnalyzers } from "../analysis/registry";
 import { ANALYSIS_VERSION } from "../analysis/pipeline";
 import type { StoredTrack } from "./library";
 
@@ -7,7 +8,7 @@ export function reviewReasons(track: StoredTrack): string[] {
   const a = track.analysis;
   if (!a) return ["Not analysed"];
   const reasons: string[] = [];
-  if ((track.analysisVersion ?? 0) < ANALYSIS_VERSION || !a.loudness || !a.energy) reasons.push("Analysis needs updating");
+  if ((track.analysisVersion ?? 0) < ANALYSIS_VERSION || !a.loudness || !a.energy || staleAnalyzers(a).length > 0) reasons.push("Analysis needs updating");
   if (!track.manualGrid && track.manualBpm === null && a.tempo.confidence < 0.7) reasons.push("Tempo confidence below 70%");
   if (!track.manualGrid && a.grid.gridConfidence < 0.7) reasons.push("Beat-grid confidence below 70%");
   if (track.manualKeyTonic === null) {

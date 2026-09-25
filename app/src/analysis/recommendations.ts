@@ -1,3 +1,4 @@
+import type { TrackMetadata } from "../db/catalog";
 /**
  * Transition recommendations (research Phase L).
  *
@@ -10,7 +11,7 @@
  * weights are visible and adjustable, and feedback is recorded so they can be
  * revisited against real choices later.
  */
-import { effectiveBpm, effectiveKey, type StoredTrack } from "../db/library";
+import { effectiveBpm, effectiveKey } from "../db/library";
 import { camelotLabel } from "../dsp/key";
 
 export interface Reason {
@@ -22,7 +23,7 @@ export interface Reason {
 }
 
 export interface Recommendation {
-  track: StoredTrack;
+  track: TrackMetadata;
   /** 0..100. */
   score: number;
   reasons: Reason[];
@@ -131,7 +132,7 @@ export function vocalScore(from: number, to: number): { score: number; text: str
 }
 
 /** Does the incoming track open in a way that suits mixing in? */
-export function sectionScore(track: StoredTrack): { score: number; text: string } {
+export function sectionScore(track: TrackMetadata): { score: number; text: string } {
   const sections = track.analysis?.structure?.sections;
   if (!sections || sections.length === 0) {
     return { score: 0.5, text: "No structure analysed" };
@@ -161,8 +162,8 @@ export interface RecommendOptions {
 }
 
 export function recommend(
-  source: StoredTrack,
-  candidates: readonly StoredTrack[],
+  source: TrackMetadata,
+  candidates: readonly TrackMetadata[],
   options: RecommendOptions = {},
 ): Recommendation[] {
   const bpm = effectiveBpm(source);

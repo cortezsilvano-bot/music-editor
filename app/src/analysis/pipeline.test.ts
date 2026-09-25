@@ -29,6 +29,10 @@ describe("analyze", () => {
     expect(result.tempo.bpm).toBeLessThan(127);
     expect(result.grid.anchors.length).toBeGreaterThan(0);
     expect(result.key.camelot).toMatch(/^([1-9]|1[0-2])[AB]$/);
+    expect(result.phrases?.phrases.length).toBeGreaterThan(0);
+    expect(result.hpss).toBeDefined();
+    expect(result.keySupport?.method).toBe("median-hpss-bass-chroma");
+    expect(Number.isFinite(result.energy.rawScore)).toBe(true);
   });
 
   it("does not modify the caller's audio", () => {

@@ -83,6 +83,20 @@ app.whenReady().then(async () => {
       }))()
     `);
 
+    // The original app is embedded as the Studio tab and must load under the
+    // desktop's app:// origin as well as over http.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const studio = await window.webContents.executeJavaScript(`
+      (() => {
+        const f = document.querySelector("iframe.studio-frame");
+        try {
+          const d = f && f.contentDocument;
+          return { present: !!f, kids: d && d.getElementById("root") ? d.getElementById("root").childElementCount : 0,
+                   text: d ? (d.body.innerText || "").slice(0, 60) : "" };
+        } catch (e) { return { present: !!f, kids: 0, text: "blocked: " + e }; }
+      })()
+    `);
+    check("Studio tab embeds the original app", studio.present && studio.kids > 0, studio.text.replace(/\s+/g, " "));
     check("React mounted", probe.rootChildren > 0, `root has ${probe.rootChildren} child(ren)`);
     check("app heading rendered", probe.heading === "Music Editor", String(probe.heading));
     check("preload bridge exposed", probe.bridge === "object", probe.bridge);

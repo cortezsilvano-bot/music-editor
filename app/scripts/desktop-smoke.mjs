@@ -70,7 +70,10 @@ try {
   await page.locator('input[type="file"]').first().setInputFiles(fixture);
   await page.getByRole("alert").filter({ hasText: "Skipped exact duplicate" }).waitFor();
   assert.equal(await page.locator(".library .row").count(), 1);
-  await page.locator(".export-panel input").first().fill("F:/Music");
+  // Export is gated on review state — clear review before downloading XML.
+  const markReviewed = page.getByRole("button", { name: "Mark reviewed", exact: true });
+  if (await markReviewed.count()) await markReviewed.click();
+  await page.getByLabel("Export audio folder", { exact: true }).fill("F:/Music");
   const exportPath = path.join(dir, "export.xml");
   await app.evaluate(({ session }, exportPath) => {
     globalThis.smokeDownload = "waiting";

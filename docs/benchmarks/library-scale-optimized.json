@@ -1,0 +1,151 @@
+{
+  "date": "2026-09-23T04:56:52.296Z",
+  "runtime": {
+    "node": "24.21.0",
+    "acorn": "8.18.0",
+    "ada": "4.0.0",
+    "amaro": "1.1.11",
+    "ares": "1.34.8",
+    "brotli": "1.2.0",
+    "cldr": "48.0",
+    "icu": "78.2",
+    "llhttp": "9.4.3",
+    "merve": "1.2.2",
+    "modules": "149",
+    "napi": "10",
+    "nbytes": "0.1.4",
+    "ncrypto": "0.0.1",
+    "nghttp2": "1.70.0",
+    "nghttp3": "",
+    "ngtcp2": "",
+    "openssl": "0.0.0",
+    "simdjson": "4.6.7",
+    "simdutf": "7.7.0",
+    "sqlite": "3.53.4",
+    "tz": "2025c",
+    "undici": "7.29.1",
+    "unicode": "17.0",
+    "uv": "1.52.1",
+    "uvwasi": "0.0.23",
+    "v8": "15.2.124.28-electron.0",
+    "zlib": "1.3.2.1-motley",
+    "zstd": "1.6.0",
+    "electron": "44.4.3",
+    "chrome": "152.0.7977.130"
+  },
+  "totalMemoryBytes": 68484825088,
+  "cpu": "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz",
+  "results": [
+    {
+      "count": 10000,
+      "seedMs": 5816.3,
+      "loadAllMs": 1873.9,
+      "indexedPageMs": 17.3,
+      "search": {
+        "medianMs": 3.4,
+        "p95Ms": 9.5
+      },
+      "filter": {
+        "medianMs": 7.8,
+        "p95Ms": 12.4
+      },
+      "sortName": {
+        "medianMs": 20.2,
+        "p95Ms": 21.5
+      },
+      "sortBpm": {
+        "medianMs": 2.8,
+        "p95Ms": 4
+      },
+      "interactiveQueryGatePassed": true,
+      "waveformBytes": 80000000,
+      "optimized": {
+        "queryPreparationMs": 10.4,
+        "coldNameSortMs": 12.4,
+        "search": {
+          "medianMs": 0.9,
+          "p95Ms": 3.8
+        },
+        "filter": {
+          "medianMs": 1.4,
+          "p95Ms": 2.7
+        }
+      },
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    },
+    {
+      "count": 50000,
+      "seedMs": 31715.2,
+      "loadAllMs": 9267.5,
+      "indexedPageMs": 14.1,
+      "search": {
+        "medianMs": 14.8,
+        "p95Ms": 20.7
+      },
+      "filter": {
+        "medianMs": 30.6,
+        "p95Ms": 35.3
+      },
+      "sortName": {
+        "medianMs": 112.9,
+        "p95Ms": 114
+      },
+      "sortBpm": {
+        "medianMs": 11.8,
+        "p95Ms": 12.8
+      },
+      "interactiveQueryGatePassed": true,
+      "waveformBytes": 400000000,
+      "optimized": {
+        "queryPreparationMs": 47.7,
+        "coldNameSortMs": 64.9,
+        "search": {
+          "medianMs": 6.7,
+          "p95Ms": 14.8
+        },
+        "filter": {
+          "medianMs": 12.4,
+          "p95Ms": 13.4
+        }
+      },
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    },
+    {
+      "count": 100000,
+      "seedMs": 35878.4,
+      "loadAllMs": 19596.5,
+      "indexedPageMs": 1458.6,
+      "search": {
+        "medianMs": 27.1,
+        "p95Ms": 31.9
+      },
+      "filter": {
+        "medianMs": 68.3,
+        "p95Ms": 73
+      },
+      "sortName": {
+        "medianMs": 251.5,
+        "p95Ms": 261.5
+      },
+      "sortBpm": {
+        "medianMs": 24.5,
+        "p95Ms": 26.6
+      },
+      "interactiveQueryGatePassed": false,
+      "waveformBytes": 800000000,
+      "optimized": {
+        "queryPreparationMs": 98.7,
+        "coldNameSortMs": 142,
+        "search": {
+          "medianMs": 12.8,
+          "p95Ms": 37.1
+        },
+        "filter": {
+          "medianMs": 28.5,
+          "p95Ms": 29.5
+        }
+      },
+      "limits": "Synthetic full track records: real IndexedDB, 2000-float peaks, analysis objects, 44-byte audio placeholders. No real media I/O, DOM/React rendering, scroll, or decoder throughput measurement."
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Filesystem operations for the desktop build.
  *
  * Two rules govern everything here:
@@ -226,4 +226,26 @@ async function writeTags(filePath, payload) {
   }
 }
 
-module.exports = { grantRoot, isPermitted, scanFolder, readFile, writeTags, AUDIO_EXTENSIONS };
+
+/**
+ * Existence/size check. Metadata only - no bytes are returned.
+ *
+ * Unlike read/write, this accepts any absolute path so the library can detect
+ * a missing filePath after a restart without forcing the user to re-grant the
+ * folder first. Reading and writing still require grantRoot.
+ */
+async function pathStatus(filePath) {
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    return { ok: false, error: "Path is required." };
+  }
+  try {
+    const st = await fs.stat(filePath);
+    return { ok: true, exists: st.isFile(), sizeBytes: st.isFile() ? st.size : 0 };
+  } catch (error) {
+    if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) {
+      return { ok: true, exists: false, sizeBytes: 0 };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+module.exports = { grantRoot, isPermitted, scanFolder, readFile, writeTags, pathStatus, AUDIO_EXTENSIONS };

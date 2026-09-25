@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Local-first library storage (research Phase A).
  *
  * IndexedDB via Dexie. Audio is kept as a Blob so a reloaded library still
@@ -14,6 +14,7 @@ import type { AnalysisResult } from "../analysis/pipeline";
 import { gridBpm, setGridBpm } from "../dsp/gridEdit";
 import type { BeatGrid } from "../dsp/beats";
 import { EMPTY_TAGS, type TrackTags } from "../metadata/tags";
+import { installCatalog, type CatalogTrack, type CatalogKey, type CatalogState, type TrackMetadata } from "./catalog";
 
 export interface StoredTrack {
   id: string;
@@ -65,6 +66,41 @@ export interface AnalysisJob {
   queuedAt: number;
   attempts: number;
   error: string | null;
+  /** Optional for compatibility with pre-v10 jobs. New jobs always populate these. */
+  phase?: "analysis" | "stems";
+  trackId?: string;
+  stemOptions?: { backend: "demucs" | "dsp"; quality: "balanced" | "high"; stems: "basic" | "two" };
+  remoteCancelPending?: boolean;
+  runId?: string;
+  owner?: string | null;
+  attemptId?: string | null;
+  leaseUntil?: number | null;
+  lastHeartbeatAt?: number | null;
+  updatedAt?: number;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  maxAttempts?: number;
+  nextAttemptAt?: number;
+  errorCode?: string | null;
+  stage?: string;
+  progress?: number;
+}
+
+export interface JobEvent {
+  id?: number;
+  jobId: string;
+  runId: string;
+  at: number;
+  status: AnalysisJob["status"];
+  errorCode: string | null;
+  message: string | null;
+}
+
+export interface AnalysisSnapshot {
+  id: string;
+  trackId: string;
+  savedAt: number;
+  result: AnalysisResult;
 }
 
 export class LibraryDatabase extends Dexie {
@@ -73,6 +109,13 @@ export class LibraryDatabase extends Dexie {
   stemCache!: EntityTable<import("./stems").StemCacheEntry, "id">;
 
   jobs!: EntityTable<AnalysisJob, "id">;
+  jobEvents!: EntityTable<JobEvent, "id">;
+  analysisHistory!: EntityTable<AnalysisSnapshot, "id">;
+  trackCatalog!: EntityTable<CatalogTrack, "id">;
+  catalogKeys!: EntityTable<CatalogKey, "id">;
+  catalogState!: EntityTable<CatalogState, "id">;
+  playlists!: EntityTable<import("./playlists").Playlist, "id">;
+  peakPyramids!: EntityTable<import("./peakPyramids").StoredPeakPyramid, "id">;
 
   constructor(name = "music-editor") {
     super(name);
@@ -140,23 +183,58 @@ export class LibraryDatabase extends Dexie {
       tracks: "id, name, addedAt, analysisVersion, reviewedAt, &contentHash",
       jobs: "id, status, priority, queuedAt",
     });
+    this.version(10).stores({
+      jobs: "id, status, priority, queuedAt, leaseUntil, nextAttemptAt",
+      jobEvents: "++id, jobId, runId, at",
+    }).upgrade(async tx => {
+      await tx.table<AnalysisJob>("jobs").toCollection().modify(job => {
+        job.phase = "analysis";
+        job.runId = crypto.randomUUID();
+        job.owner = null; job.attemptId = null; job.leaseUntil = null;
+        job.maxAttempts = 3; job.nextAttemptAt = 0;
+        job.updatedAt = job.queuedAt;
+        job.stage = job.status; job.progress = job.status === "done" ? 1 : 0;
+      });
+    });
+    this.version(11).stores({ analysisHistory: "id, trackId, savedAt" });
+    this.version(12).stores({ jobs: "id, status, priority, queuedAt, leaseUntil, nextAttemptAt, trackId, phase" })
+      .upgrade(async tx => { await tx.table<AnalysisJob>("jobs").toCollection().modify(job => { job.trackId = job.id; }); });
+    this.version(13).stores({
+      trackCatalog: "id", catalogKeys: "id, [addedAt+id], [bpm+id], stale", catalogState: "id",
+    });
+    // v14: in-app playlists + on-disk waveform peak pyramids (keyed by content hash).
+    this.version(14).stores({
+      playlists: "id, name, updatedAt",
+      peakPyramids: "id, contentHash, trackId",
+    });
+    // v15: multiEntry search tokens + flag indexes; persisted catalog count via middleware.
+    this.version(15).stores({
+      catalogKeys: "id, [addedAt+id], [bpm+id], stale, *tokens, review, failed, reviewed",
+    }).upgrade(async (tx) => {
+      // Invalidate projection checkpoint so indexCatalogBatch rewrites keys with tokens.
+      await tx.table("catalogState").put({ id: "tracks", version: "", after: null, complete: false });
+    });
+    installCatalog(this);
   }
 }
 
 export const db = new LibraryDatabase();
 
-export function effectiveBpm(track: StoredTrack): number | null {
+export { effectiveBpm as effectiveBpmFromCatalog } from "./trackValues";
+export type { TrackMetadata } from "./catalog";
+
+export function effectiveBpm(track: TrackMetadata): number | null {
   if (track.manualGrid?.anchors.length) return gridBpm(track.manualGrid);
   if (track.manualBpm !== null) return track.manualBpm;
   return track.analysis?.tempo.bpm ?? null;
 }
 
-export function bpmIsManual(track: StoredTrack): boolean {
+export function bpmIsManual(track: TrackMetadata): boolean {
   return track.manualGrid != null || track.manualBpm !== null;
 }
 
 export function effectiveKey(
-  track: StoredTrack,
+  track: TrackMetadata,
 ): { tonic: number; mode: "major" | "minor"; manual: boolean } | null {
   if (track.manualKeyTonic !== null && track.manualKeyMode !== null) {
     return { tonic: track.manualKeyTonic, mode: track.manualKeyMode, manual: true };
@@ -174,16 +252,26 @@ export function effectiveKey(
  * re-analysis must not erase overrides is enforced in one spot rather than
  * trusted to every call site.
  */
-export async function saveAnalysis(id: string, result: AnalysisResult): Promise<void> {
-  await db.tracks.update(id, {
-    analysis: result,
-    analysisVersion: result.analysisVersion,
-    analysisError: null,
-    reviewedAt: null,
-    // Lifted out of the result so duplicate scanning does not have to load and
-    // walk every stored analysis object.
-    fingerprint: result.fingerprint?.buffer.slice(0) as ArrayBuffer | undefined,
+/** Atomic result/history write. This never touches manual overrides, cues or locks. */
+export async function persistAnalysis(
+  database: LibraryDatabase, id: string, result: AnalysisResult, snapshotId: string = crypto.randomUUID(),
+): Promise<void> {
+  await database.transaction("rw", database.tracks, database.analysisHistory, async () => {
+    const prior = await database.tracks.get(id);
+    if (!prior) return;
+    if (prior.analysis && !(await database.analysisHistory.where("trackId").equals(id).count())) {
+      await database.analysisHistory.add({ id: `legacy:${id}`, trackId: id, savedAt: Date.now(), result: prior.analysis });
+    }
+    await database.analysisHistory.add({ id: snapshotId, trackId: id, savedAt: Date.now(), result });
+    await database.tracks.update(id, {
+      analysis: result, analysisVersion: result.analysisVersion, analysisError: null, reviewedAt: null,
+      fingerprint: result.fingerprint?.buffer.slice(0) as ArrayBuffer | undefined,
+    });
   });
+}
+
+export async function saveAnalysis(id: string, result: AnalysisResult): Promise<void> {
+  await persistAnalysis(db, id, result);
 }
 
 /**
@@ -303,9 +391,47 @@ export async function trackByFilePath(filePath: string): Promise<StoredTrack | u
   return db.tracks.where("filePath").equals(filePath).first();
 }
 
+/** Point a library row at a new absolute path without touching analysis. */
+export async function setTrackFilePath(
+  id: string,
+  filePath: string,
+  relativePath?: string,
+): Promise<void> {
+  await db.tracks.update(id, {
+    filePath,
+    ...(relativePath !== undefined ? { relativePath } : {}),
+  });
+}
+
 export async function removeTrack(id: string): Promise<void> {
-  await db.transaction("rw", db.tracks, db.jobs, async () => {
+  await db.transaction("rw", [db.tracks, db.jobs, db.jobEvents, db.analysisHistory, db.playlists, db.peakPyramids], async () => {
+    const jobs = await db.jobs.where("trackId").equals(id).toArray();
+    // Pre-v12 jobs used the track id as the job primary key.
+    const legacy = await db.jobs.get(id);
+    if (legacy && !jobs.some(j => j.id === legacy.id)) jobs.push(legacy);
+    if (jobs.some(job => job.status === "running" || job.status === "queued" || job.remoteCancelPending)) {
+      throw new Error("Cancel this track's jobs and wait for cancellation before deleting it");
+    }
+    for (const job of jobs) {
+      await db.jobEvents.where("jobId").equals(job.id).delete();
+      await db.jobs.delete(job.id);
+    }
+    await db.analysisHistory.where("trackId").equals(id).delete();
+    await db.jobEvents.where("jobId").equals(id).delete();
     await db.jobs.delete(id);
+    const track = await db.tracks.get(id);
+    const playlists = await db.playlists.toArray();
+    for (const playlist of playlists) {
+      if (!playlist.trackIds.includes(id)) continue;
+      await db.playlists.update(playlist.id, {
+        trackIds: playlist.trackIds.filter((trackId) => trackId !== id),
+        updatedAt: Date.now(),
+      });
+    }
+    await db.peakPyramids.where("trackId").equals(id).delete();
+    if (track?.contentHash) {
+      await db.peakPyramids.delete(`hash:${track.contentHash}`);
+    }
     await db.tracks.delete(id);
   });
 }
@@ -316,7 +442,7 @@ export async function allTracks(): Promise<StoredTrack[]> {
 
 /** The beat grid in force: a hand edit if there is one, else the detected one. */
 export function effectiveGridOf(
-  track: StoredTrack,
+  track: TrackMetadata,
 ): { grid: BeatGrid | null; manual: boolean } {
   if (track.manualGrid) return { grid: track.manualGrid, manual: true };
   const grid = track.analysis?.grid ?? null;

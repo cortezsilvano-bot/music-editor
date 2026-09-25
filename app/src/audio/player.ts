@@ -6,15 +6,20 @@
  * you have to take on trust, and detected grids are wrong often enough that
  * trusting them silently is how bad cue points get made.
  *
- * Position is derived from `AudioContext.currentTime` rather than counted by a
- * timer, so it stays sample-accurate and never drifts against what you hear.
+ * Buffered playback uses the audio-context clock. Long files use the browser's
+ * streaming media clock; their beat click is an audition aid, not sample-accurate sync.
  */
+
+import { setAudioOutputDevice } from "./devices";
+import { MasterBus } from "./masterBus";
+import type { MasteringSettings } from "./mastering";
 
 export type PlayerState = "stopped" | "playing" | "paused";
 
 export interface PlayerListener {
   onStateChange?: (state: PlayerState) => void;
   onEnded?: () => void;
+  onError?: (message: string) => void;
 }
 
 /** How far ahead click events are scheduled, in seconds. */
@@ -25,10 +30,17 @@ const SCHEDULE_INTERVAL = 50;
 export class Player {
   private readonly context: AudioContext;
   private readonly output: GainNode;
+  private readonly masterBus: MasterBus;
   private readonly clickGain: GainNode;
 
   private buffer: AudioBuffer | null = null;
   private source: AudioBufferSourceNode | null = null;
+  private media: HTMLAudioElement | null = null;
+  private mediaNode: MediaElementAudioSourceNode | null = null;
+  private mediaUrl: string | null = null;
+  private cancelMediaLoad: (() => void) | null = null;
+  private durationHint = 0;
+  private playRequest = 0;
 
   /** Context time at which the current playback run started. */
   private startedAt = 0;
@@ -49,14 +61,25 @@ export class Player {
   constructor(context?: AudioContext) {
     this.context = context ?? new AudioContext();
     this.output = this.context.createGain();
-    this.output.connect(this.context.destination);
+    this.masterBus = new MasterBus(this.context);
+    this.output.connect(this.masterBus.input);
     this.clickGain = this.context.createGain();
     this.clickGain.gain.value = 0.35;
+    // Beat click stays dry so grid audition is not coloured by the monitor master.
     this.clickGain.connect(this.context.destination);
   }
 
   get audioContext(): AudioContext {
     return this.context;
+  }
+
+  /** Monitoring master bus (inspector playback). */
+  get mastering(): MasterBus {
+    return this.masterBus;
+  }
+
+  applyMastering(settings: Partial<MasteringSettings>): void {
+    this.masterBus.applySettings(settings);
   }
 
   setListener(listener: PlayerListener): void {
@@ -65,9 +88,62 @@ export class Player {
 
   /** Replace the loaded track. Stops whatever was playing. */
   load(buffer: AudioBuffer): void {
-    this.stop();
+    this.unload();
     this.buffer = buffer;
     this.startOffset = 0;
+  }
+
+  /** A Blob URL lets Chromium seek/read compressed bytes without full PCM in JS. */
+  async loadStream(blob: Blob, durationHint: number): Promise<void> {
+    this.unload();
+    const media = new Audio();
+    this.media = media; this.durationHint = durationHint;
+    this.mediaUrl = URL.createObjectURL(blob);
+    media.preload = "metadata";
+    this.mediaNode = this.context.createMediaElementSource(media);
+    this.mediaNode.connect(this.output);
+    media.onwaiting = () => this.stopScheduler();
+    media.onseeking = () => this.stopScheduler();
+    const resumeClicks = () => {
+      if (this.media === media && !media.paused && this.state === "playing") { this.syncClickCursor(); this.startScheduler(); }
+    };
+    media.onplaying = resumeClicks; media.onseeked = resumeClicks;
+    media.onended = () => {
+      if (this.media !== media) return;
+      this.stop(); this.listener.onEnded?.();
+    };
+    media.onerror = () => {
+      if (this.media !== media) return;
+      this.stopScheduler(); this.setState("paused");
+      this.listener.onError?.(media.error?.message || "Streaming audio could not be read");
+    };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer); media.removeEventListener("loadedmetadata", loaded); media.removeEventListener("error", failed);
+          if (this.media === media) this.cancelMediaLoad = null;
+        };
+        const loaded = () => { cleanup(); resolve(); };
+        const failed = () => { cleanup(); reject(new Error(media.error?.message || "Unsupported or unreadable streaming audio")); };
+        const timer = setTimeout(() => { cleanup(); reject(new Error("Timed out opening streaming audio")); }, 30000);
+        this.cancelMediaLoad = () => { cleanup(); reject(new DOMException("Track changed", "AbortError")); };
+        media.addEventListener("loadedmetadata", loaded); media.addEventListener("error", failed);
+        media.src = this.mediaUrl!; media.load();
+      });
+    } catch (error) { if (this.media === media) this.unload(); throw error; }
+  }
+
+  get streaming(): boolean { return this.media !== null; }
+
+  unload(): void {
+    this.stop(); this.cancelMediaLoad?.(); this.cancelMediaLoad = null;
+    if (this.media) {
+      this.media.onended = this.media.onerror = this.media.onwaiting = this.media.onplaying = this.media.onseeking = this.media.onseeked = null;
+      this.media.removeAttribute("src"); this.media.load(); this.media = null;
+    }
+    this.mediaNode?.disconnect(); this.mediaNode = null;
+    if (this.mediaUrl) URL.revokeObjectURL(this.mediaUrl);
+    this.mediaUrl = null; this.buffer = null; this.durationHint = 0;
   }
 
   setGrid(beats: Float64Array | null, firstDownbeatSec: number, beatsPerBar: number): void {
@@ -105,20 +181,31 @@ export class Player {
   }
 
   get duration(): number {
+    if (this.media) return Number.isFinite(this.media.duration) ? this.media.duration : this.durationHint;
     return this.buffer?.duration ?? 0;
   }
 
   /** Current position in seconds, derived from the audio clock. */
   get position(): number {
+    if (this.media) return this.media.currentTime;
     if (this.state !== "playing") return this.startOffset;
     const elapsed = this.context.currentTime - this.startedAt;
     return Math.min(this.startOffset + elapsed, this.duration);
   }
 
   async play(): Promise<void> {
-    if (!this.buffer || this.state === "playing") return;
+    if ((!this.buffer && !this.media) || this.state === "playing") return;
+    const request = ++this.playRequest;
     // Browsers start contexts suspended until a gesture; this is that gesture.
     if (this.context.state === "suspended") await this.context.resume();
+    if (request !== this.playRequest) return;
+    if (this.media) {
+      const media = this.media;
+      if (media.currentTime >= this.duration) media.currentTime = 0;
+      await media.play();
+      if (request !== this.playRequest || this.media !== media) return;
+      this.setState("playing"); this.syncClickCursor(); this.startScheduler(); return;
+    }
 
     const source = this.context.createBufferSource();
     source.buffer = this.buffer;
@@ -146,6 +233,8 @@ export class Player {
   }
 
   pause(): void {
+    this.playRequest++;
+    if (this.media) { this.media.pause(); this.stopScheduler(); this.setState("paused"); return; }
     if (this.state !== "playing") return;
     const at = this.position;
     this.teardownSource();
@@ -154,6 +243,11 @@ export class Player {
   }
 
   stop(): void {
+    this.playRequest++;
+    if (this.media) {
+      this.media.pause();
+      if (this.media.readyState >= 1) this.media.currentTime = 0;
+    }
     this.teardownSource();
     this.startOffset = 0;
     this.setState("stopped");
@@ -161,19 +255,34 @@ export class Player {
 
   /** Move the playhead, continuing to play if it was playing. */
   seek(seconds: number): void {
+    if (!Number.isFinite(seconds)) return;
     const target = Math.max(0, Math.min(seconds, this.duration));
+    if (this.media) {
+      this.stopScheduler();
+      try { this.media.currentTime = target; } catch (error) { this.listener.onError?.(String(error)); }
+      return;
+    }
     const wasPlaying = this.state === "playing";
     this.teardownSource();
     this.startOffset = target;
     if (wasPlaying) {
-      void this.play();
+      void this.play().catch(error => this.listener.onError?.(String(error)));
     } else {
       this.setState(this.state === "stopped" ? "stopped" : "paused");
     }
   }
 
+  /**
+   * Route playback to a specific output when Chromium exposes setSinkId.
+   * Shared helper with Mix Mode Mixer.
+   */
+  async setOutputDevice(deviceId: string): Promise<boolean> {
+    return setAudioOutputDevice(this.context, deviceId);
+  }
+
   dispose(): void {
-    this.teardownSource();
+    this.unload();
+    this.masterBus.disconnect();
     void this.context.close();
   }
 
@@ -184,6 +293,7 @@ export class Player {
   }
 
   private teardownSource(): void {
+    this.playRequest++;
     this.stopScheduler();
     if (this.source) {
       this.source.onended = null;

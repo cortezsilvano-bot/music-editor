@@ -1,129 +1,189 @@
-# Implementation report - version 0.2.0
+# Implementation report - version 0.3.2
 
-Updated 2026-09-21. Current source is the React/TypeScript app in `app/`,
-with an Electron desktop shell. This release implements a substantial part of
-the audited backlog; it does not complete all fourteen phases.
-The prior findings are preserved in
-[the completion audit](IMPLEMENTATION_REPORT_AUDIT_2026-09-21.md).
+Updated 2026-09-23. Current source is the React/TypeScript app in `app/`,
+with an Electron desktop shell and an optional Python stem service in `server/`.
+Historical detail for the September 22-23 upgrade tranche lives in
+[Upgrade implementation session](UPGRADE_SESSION_2026-09-23.md). The 0.2.0-era
+completion audit remains in
+[IMPLEMENTATION_REPORT_AUDIT_2026-09-21.md](IMPLEMENTATION_REPORT_AUDIT_2026-09-21.md).
 
-## Changes implemented
+## How to run (Windows)
 
-- Persistent analysis queue in IndexedDB schema v4, with queued/running/done/
-  failed/cancelled states, priorities, attempt counts, startup recovery,
-  timeout, explicit retry and reanalysis controls. Each job gets a dedicated
-  worker; cancellation terminates it, including during synchronous DSP.
-  Decode completion after cancellation cannot start another worker.
-- Worker crashes and import/decode failures have visible error handling.
-  Pending jobs keep audio in storage until execution instead of retaining
-  decoded channel arrays for the whole queue.
-- Legacy analysis records lacking loudness/energy render safely and can be
-  reanalysed. Migration from a real v1 schema is covered by a test.
-- Audio loading depends on selection, not analysis/metadata refresh. Grid edits
-  preserve the playing source and playhead. Old scheduled beat clicks are
-  stopped and the click cursor is resynchronised when the grid changes.
-- Tempo and manual grid now agree in the library, playback and export. Edits
-  persist together; revert clears both overrides. A grid lock snapshots the
-  effective grid so reanalysis cannot replace it. Invalid/extreme manual
-  tempos are rejected. Reviewed acknowledgement clears on new analysis.
-- Search by title/artist/album/filename; sort by name, BPM or import time;
-  All/Needs Verification/Failed/Reviewed filters; audio folder import.
-- SHA-256 exact-duplicate rejection during import, backed by a unique schema-v5
-  index. Relative folder paths are retained for export. Previously imported
-  tracks without hashes are not backfilled automatically.
-- Volume, library filter/sort and export settings persist locally.
-- Review reasons explain low tempo/grid/key confidence, relative-key ambiguity,
-  stale analysis and failures. Thresholds are heuristic, not calibrated.
-- Manual key correction and a reference-tone/chord verifier.
-- Named cues at the playhead, cue seeking/removal, persistence across reanalysis
-  and Rekordbox memory-cue export. Export uses the visible filtered track list.
-- True-peak measurement is enabled in analysis version 3. Interpolation kernels
-  are precomputed to avoid trigonometric work for every sample.
-- Per-bar energy, a visible bar-energy graph, energy-change section suggestions,
-  seeking to sections and converting suggestions into persisted cues.
-  These are heuristic suggestions, not semantic verse/chorus/vocal detection.
-- Next-track ranking with explicit tempo/key/energy reasons. Missing data is
-  handled and the source track is excluded. Scores are preparation aids, not
-  a guarantee of a good transition.
-- Desktop external-link handling permits only HTTP(S); external navigation and
-  invalid custom-protocol hosts/paths are rejected.
-- A Windows CI workflow for tests/lint/build was added. Hosted execution has
-  not been verified because this workspace is not a Git checkout.
+From `F:\Dev_apps\Music_editor`:
 
-## Phase status after this implementation
+```powershell
+cd app
+npm install
+npm run desktop:dev          # build renderer + launch Electron
+# optional stem service (also Start-able from the Stems panel in desktop):
+cd ..\server
+pip install -r requirements.txt
+.\run.ps1
+```
 
-| Phase | Implemented | Still required for full scope |
+Useful commands (from `app/`):
+
+| Script | Purpose |
+|---|---|
+| `npm test` / `npm run lint` / `npm run build` | unit checks |
+| `npm run test:desktop` | Electron smoke (Playwright) |
+| `npm run verify` | lint + test + build + desktop/job/catalog smokes |
+| `npm run verify:stems` | verify + Python stem tests + stems smoke |
+| `npm run desktop:build` | NSIS installer under `app/release/` |
+
+Installer artifacts include `app/release/0.3.2/MusicEditor-Setup-0.3.2.exe`
+(and retained 0.2.0 / 0.3.0 / 0.3.1 builds). The installer is unsigned.
+
+## Current capability (0.3.2 + this session)
+
+Already present before this session (do not re-implement):
+
+- Dexie schema through **v13** (durable jobs, leases, stem cache, paged catalog)
+- Native file bridge: preload/IPC (`pickFolder`, `scanFolder`, `readFile`, `writeTags`)
+- Safe atomic tag write with backups (MP3 + FLAC)
+- Multi-window queue leases, configurable analysis timeout, bounded PCM cache
+- Mix Mode (two decks, EQ, crossfader, sync, loops, hot cues, WSOLA)
+- Stems client (`StemsPanel` / `stems/service.ts` / `stems/jobs.ts`) against `localhost:8787`
+- Fingerprints + Duplicates panel, library virtualization, output device selection
+- Full v0.2.0 analysis/library checklist (queue cancel, grid lock, cues, true peak, etc.)
+
+Added in this session:
+
+- **Mastering panel discoverability (2026-09-24 UX)** - `MasteringPanel` moved to the top of the right inspector (under Play transport / before Reanalyse + analysis facts; also first after empty state). Bypass checkbox + visible hint (bypass default on). Accent left border. DSP/defaults unchanged; monitor-only. Mix Mode compact strip kept.
+
+
+- **Structured logging** - `app/src/util/logger.ts` (`createLogger(scope)`). Tagged JSON lines via `console.warn` / `console.error`. Optional `music-editor.logLevel` (`"debug"`|`"info"`|`"warn"`|`"error"`, JSON via localStorage). Light hooks on scheduler start/fail, tag write, stem request.
+- **Feature flags** - localStorage keys (default **ON**):
+  - `featureMixMode`
+  - `featureStems`
+  - `featureDuplicates`
+  Helpers in `app/src/ui/features.ts`. View buttons / panels are gated in `App.tsx`.
+- **Missing-file / Relocate** - `desktop:pathStatus`, `desktop:pickAudioFile`, `FileLocationPanel`, `relocateTrackFile` (keeps analysis when SHA-256 matches; hash mismatch refuses and asks for a normal import).
+- **Electron-supervised stem service** - `electron/stemsService.cjs` + IPC `startStemsService` / `stopStemsService` / `stemsServiceStatus`. **Does not auto-start on launch.** Start/Stop controls in Stems panel; external servers still work. Spawns repo `server/` uvicorn; does not bundle Demucs weights. Stop-on-quit only for a process this app started.
+
+## Feature flag keys
+
+| Key | Default | Effect when off |
 |---|---|---|
-| A - Foundations | Strict TS app, schema v1-v5, persistent settings, worker scheduler, tests, CI configuration, Electron packaging | Hosted CI run, structured logging, feature flags, library-scale validation, original native-core architecture |
-| B - Library/playback/waveform | File/folder import, tags, search/filter/sort, exact import dedup, persistent audio, playback, waveform | Native source paths/relocation, playlists, device selection, waveform pyramid/zoom/pan, virtualization, 100k-track tests |
-| C - Preprocessing | Mono/resample/STFT, timings, global analysis version, import content hashes | Per-stage caching/invalidation, silence/gain records, backfill of old hashes |
-| D - Tempo/grid | DSP, grid corrections, consistent tempo/grid persistence, lock, audible verification | Dynamic anchor editor, phrase estimation, further tempo refinement, labelled evaluation |
-| E - Key/harmony | Tuning/chroma/profile scoring, notation, manual correction, reference tone/chord panel | HPSS/bass chroma, local voting, modulation/segment keys, calibrated evaluation |
-| F - Loudness/energy | Loudness/LRA, true peak in pipeline, raw energy features, per-bar curve and display | Independent compliance validation, library-relative renormalization, evaluation of energy model; bar graph follows automatic grid |
-| G - Metadata/export | Tag reading, filtered M3U8/Rekordbox export, relative paths, manual cue export | Native file bridge and safe tag writing/backups/atomic replacement, real-path resolution and destination-app import checks |
-| H - Structure/cues | Persistent editable cue list, energy-change section suggestions and cue conversion | Vocal activity, semantic sections, richer cue editor/generation, manual section editing and validation |
-| I - Confidence/review | Needs Verification filter, reasons, reviewed flag, heuristic thresholds, corrections | Threshold settings/calibration, write/export enforcement, review history |
-| J - Scheduler | Durable queue, priority, recovery, timeout, cancellation, worker failure handling, manual retry | Multi-window ownership, automatic retry/backoff, detailed queue-management UI and concurrency/load testing |
-| K - Two-deck mixing | Not implemented | Second deck, EQ, crossfader, sync, loops, hot cues; panel-writing command was blocked by automatic approval review |
-| L - Recommendations | Explained tempo/key/energy next-track ranking | Transition audition/evaluation, feedback learning/history, section/vocal-aware ranking |
-| M - Stems/mashup | Existing separate Python separation service only | Desktop service lifecycle, app integration, stored stems, mixing/mashup workflow; panel-writing command was blocked by automatic approval review |
-| N - Duplicates | Exact hash rejection for newly imported files | Hashing legacy library, acoustic fingerprints, duplicate groups/review, safe resolution UI |
+| `featureMixMode` | true | Hide Mix view |
+| `featureStems` | true | Hide Stems panel |
+| `featureDuplicates` | true | Hide Duplicates view |
 
-No phase is labelled complete solely because a component or UI control exists.
+Set via DevTools, e.g. `localStorage.setItem("music-editor.featureMixMode", "false")`, then reload ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â or use the in-app Settings panel (no DevTools required).
 
-## Verification
+Added after the logging/flags/relocate session (still 0.3.2 software):
 
-- `npm test`: **172 tests pass, 18 files**.
-- `npm run lint`: passes with zero warnings.
-- `npm run build`: TypeScript and Vite pass.
-- `npm run test:desktop`: builds then runs an automated Electron workflow using
-  a generated WAV and a temporary profile, without modifying the user's library.
-- Electron workflow verifies import, worker analysis, real IndexedDB Blob
-  round-trip with a byte-content SHA-256 check, reload/playback, preserving the
-  active source during grid edits, exact duplicate rejection, cue export,
-  legacy-record rendering and reanalysis preserving manual edits/cues.
-- Scheduler/worker tests cover cancellation during decode and during worker
-  execution, ignoring late results, worker errors, recovery, priority, timeout
-  and manual retry. Playback tests check stale-click cancellation.
-- Migration test opens a real old schema in fake-indexeddb and upgrades it,
-  preserving analysis and manual corrections. Cue/lock/hash tests cover storage.
+- **Settings UI** - `SettingsPanel` toggles `featureMixMode` / `featureStems` / `featureDuplicates` and log level (`music-editor.logLevel` via `useSetting("logLevel")`). Helpers `getLogLevel` / `setLogLevel` in `logger.ts`.
+- **Export / tag-write review gate** - `export/reviewGate.ts`: catalog `review` flags skip those tracks from Export (default: no override; clear tracks still export). Tag write blocks when `needsReview` unless "Write despite review".
+- **Batch missing-file scan** - `MissingFilesPanel` + `desktop/batchRelocate.ts`: scan stored paths; Relocate folder matches unique `relativePath` then unique basename; still refuses hash mismatches via `relocateTrackFile`.
+- **Waveform zoom/pan** - `WaveformView` + `ui/waveformPeaks.ts` (view window sample/zoom/pan; playhead mapped to window). Wheel zoom, Shift+wheel/drag pan, Home/reset.
 
-The desktop test checks actual Electron behavior, but it does not certify the
-sound heard through hardware, Rekordbox import, or installer install/uninstall.
-The source's true-peak test is not a standards-compliance certification.
+## Shipped this session (still 0.3.2 software; acceptance gates open)
 
-## Windows release artifact
+- **In-app playlists** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Dexie v14 `playlists` table; create/rename/delete; add/remove/reorder selected track; open as library filter (`PlaylistsPanel` + `db/playlists.ts`). Migration test for v13ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢v14.
+- **File log sink (Electron)** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â append-only `userData/logs/music-editor.log` with 2 MiB rotation (1 backup); preload/IPC `appendLog` / `logPath` / `openLogFolder`; Settings shows path + open folder; default ON in Electron, OFF in browser.
+- **On-disk peak pyramid** ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Dexie `peakPyramids` keyed by content hash; built on first waveform view; WaveformView selects level by zoom span; invalidated on hash change.
+- **Cold-search tighten** â€” catalog `matchingKeys` filters then sorts and caches by `sort|filter|needle`.
+- **UPG-002 synthetic 100k gate (software)** â€” Dexie **v15** `catalogKeys` multiEntry `*tokens` (unigrams + adjacent bigrams), flag indexes, persisted revision `count`, nearer-end deep page fetches, and multi-word bigram IDB lookup before `includes` filter. Same synthetic bench (`npm run benchmark:catalog`, `CATALOG_BENCH_SIZES=100000`). **100k before â†’ after (ms):** first-page reopen **372.7 â†’ 7.8**, cold search **1525 â†’ 118.1**, deep last-page jump **1139.6 â†’ 5.6**. All three under 200 ms on this machine. Real-device / disk-cold acceptance still separate. No SQLite.
 
-Installer: `app/release/0.2.0/MusicEditor-Setup-0.2.0.exe`.
-Packaging completed successfully with
-`npx electron-builder --win --config.directories.output=release/0.2.0`.
-A separate output folder was used because the prior unpacked app held a DLL
-open in `release/win-unpacked`. The prior installer was retained.
-The packaged ASAR reports version 0.2.0 and its renderer entry matches the
-validated production build. The final source build also passed the Electron
-workflow test after the worker-protocol cleanup.
 
-## Remaining constraints
+Added for packaged stem supervise + export round-trip (still 0.3.2 software):
 
-- Automatic approval review rejected the command to create the two-deck and
-  stem panels with the reason `blocked by policy`; no more specific reason was
-  supplied. Those panels were not written or included in the installer.
-- Safe native tag writing, advanced DSP, acoustic duplicate matching and
-  large-library performance remain substantial implementation work.
-- The scheduler assumes one active app instance for a library. Multi-window
-  coordination is not implemented. A second scheduler can recover a job that
-  another instance is still processing; avoid running two instances on the
-  same profile until ownership is added.
-- Analysis timeout is two minutes per attempt; exceptionally long tracks may
-  require a future configurable timeout. Decoded playback buffers are cached
-  without a size limit; allTracks still loads entire stored track records.
-- The library remains IndexedDB-based. No native filesystem bridge or tag
-  writer has been added. Folder export asks for the parent of the imported
-  relative paths; it cannot discover actual file locations automatically.
-- Installer is unsigned. The prior 0.1.0 installer is retained separately.
+- **Packaged stem server root** - `electron/stemsService.cjs` resolves `MUSIC_EDITOR_SERVER_ROOT` / Choose server folder, then `resources/server` when packaged, then checkout `../server`. electron-builder `extraResources` copies server source + requirements + run scripts only (no venv, no torch/Demucs weights). Stems panel shows resolved path + missing-server errors. Default remains **no auto-start** on launch.
+- **Export software round-trip tests** - `src/export/verifyParse.ts` + `roundTrip.test.ts` parse Rekordbox XML / M3U8 and assert BPM/key/cues/grid survive; review-gate skip stays consistent. Physical import into Rekordbox/Serato remains an acceptance gate.
 
-## Next work
+## Long-file streaming (software Partial; physical acceptance Open)
 
-Finish multi-window queue ownership and configurable timeouts; build the native
-file bridge and safe metadata writing; implement the blocked two-deck/stem
-workflows once the policy restriction is resolved; then complete advanced DSP,
-waveform navigation, acoustic duplicates and full acceptance validation.
+Wired 2026-09-23. Defaults from `app/src/audio/decodePolicy.ts`:
+
+- Stream when `durationSec > 15 min`, or estimated PCM `> 128MB`, or encoded `> 64MB`.
+- **Inspector / main Player**: `shouldStream(track)` uses `player.loadStream(blob, durationHint)` (HTMLAudioElement + MediaElementSource). Full PCM is **not** stored in `decodedRef` for those tracks. UI shows a streaming note; beat click remains audition-only (as `player.ts` documents). Seek/cues/phrases use `player.seek` on the media clock.
+- **Short files**: unchanged decode + `AudioBufferCache` (256MB LRU) path.
+- **Mix Mode**: oversized tracks load via `Deck.loadStream` (HTMLAudioElement into the existing EQ/crossfade graph). Short tracks keep full-PCM Worklet + WSOLA. Streaming decks support play/pause/seek/EQ/crossfade/gain; WSOLA key-lock, beat loops, slip, and rolls are disabled with an explicit amber banner (`MIX_MODE_STREAM_LIMITS`). Tempo/phase sync on stream uses `playbackRate` + media-clock seek (not sample-accurate WSOLA). `mixModeUsesStream` chooses the path; `mixModeDecodeRefusal` now always returns null. No silent first-N-minutes decode.
+- **Analysis**: `analysisDecodeRefusal` in `workerRunner` Ã¢â‚¬â€ fail the job with a clear decode error rather than OOM. No first-N-minutes partial analyze by default.
+- **Not claimed done**: physical 1h/2h/3h RAM soak, device hotplug/sleep-wake soak. UPG-002 **synthetic** 100k gate met (see above); real-device 100k still Open. UPG-007 / Phase 3 remain **software Partial**; UPG-008 software hooks Partial (see below); multi-hour / physical device acceptance still **Open**.
+
+
+## Device recovery (UPG-008 software Partial; physical acceptance Open)
+
+Wired 2026-09-23. Shared helpers in `app/src/audio/devices.ts`:
+
+- `watchOutputDevices` - listen for `devicechange`, re-enumerate outputs
+- `recoverOutputSelection` - if selected sink is gone, fall back to system default with a clear status message
+- `setAudioOutputDevice` / `supportsAudioOutputSelection` - shared `setSinkId` path used by Mix `Mixer` and inspector `Player`
+- `attachAudioContextRecovery` - `statechange` + visibility/focus resume attempt when transport still wants to play
+
+**Mix Mode:** controlled output select (includes System default); on device loss applies fallback + amber note; context recovery updates the same status line.
+
+**Inspector:** App attaches context recovery to the main Player context; suspend/interrupt surfaces via `setNotice`.
+
+Verify after UPG-002 catalog work: **434 tests / 48 files** green (lint + build + desktop/job/catalog smokes).
+
+**Not claimed done:** physical USB/BT unplug while playing, Bluetooth drop, multi-hour sleep/wake soak. UPG-008 acceptance remains **Open**.
+
+## Remaining work (not done here)
+
+- Phrase estimation / HPSS / bass chroma / library energy / audition: **software landed this session** (heuristics; see below). Not labelled-corpus, EBU, or stem-quality certified.
+- Packaged stem supervise: software path resolve + extraResources source ship done; system Python + pip still required; Demucs/torch weights never bundled; physical Demucs GPU/OOM remains Open
+- Real-device 100k-track media/RAM acceptance (synthetic UPG-002 gate met); signed installers (Authenticode)
+- Physical long-file (1h/2h/3h bounded-memory soak) / device hotplug/sleep-wake / Demucs GPU-OOM gates Ã¢â‚¬â€ inspector + Mix Mode streaming + UPG-008 software recovery hooks wired; physical soak still Open
+- Installer upgrade/rollback on a real user profile
+
+## UI modernize pass (software, 2026-09-24 evening)
+
+Visible dark DJ / library redesign so `npm run desktop:dev` no longer looks like the old dense gray utility chrome. **Not acceptance / not phase complete.**
+
+- Design tokens: layered `--bg` / `--shell` / `--panel*` / `--card`, brighter teal `--accent` (#22b8cf), soft accent fills, elevation shadows, larger radius scale.
+- Product header (brand mark + gradient title), pill view tabs, pill Import/Add actions.
+- Toolbar search as real pill search field; toolbar meta styling.
+- Library pane with section head; selected/hover rows with accent inset + soft fill; track titles bolder.
+- Inspector: facts/grid/export as elevated cards; uppercase tracked section labels; taller waveform chrome.
+- Mastering panel: featured card (glow gradient, accent border, stronger title) — still monitor-only, Bypass default on.
+- Mix Mode: same card/deck/crossfader tokens + larger Mix title.
+- Light JSX only in `App.tsx` / `MixMode.tsx` / `LibraryList` row height 68; no DSP/workflow changes.
+- Verify 2026-09-24 CT evening: **442 tests / 49 files**; lint + build + desktop/job/catalog smokes green.
+
+Tip: close old Electron windows, then `cd F:\Dev_apps\Music_editor\app && npm run desktop:dev`.
+
+
+## Software leftovers landed (still 0.3.2; heuristic, not certified)
+
+- **Phrase estimation** - `dsp/phrase.ts`. 8/16/32-bar phrases on the **effective** grid (locked/manual BPM respected in the UI). Waveform `P#` labels + inspector list. Grid heuristic only; no labelled-corpus accuracy claim. `ANALYSIS_VERSION` is **5**.
+- **HPSS + bass chroma** - median-filter HPSS on the key spectrogram (`dsp/hpss.ts`). Bass-weighted chroma from the harmonic residual is a **confidence aid** (`applyKeySupport`); it does not replace `detectKey` or a user key override. Not a stem separator.
+- **Library energy renormalization** - `energy.rawScore` stored beside raw features; `libraryEnergyDisplay` maps the library percentile to a 0-10 display. Intra-track 1-10 level and raw features are not overwritten. Bar graph uses `barsFromGrid` on the effective grid.
+- **Transition audition** - `analysis/audition.ts` builds ranking-to-preview payload (durations, effective BPM pair, short end-of-outgoing window). Inspector **Audition** loads Mix Mode decks, beat-syncs, starts a short overlap, and `logFeedback`s `played`. Mix Mode itself is not rewritten.
+
+## Security / secrets note
+
+Root `.env` may contain `ANTHROPIC_API_KEY`. That key is unrelated to the desktop app runtime and **should be rotated** if this tree was shared. Do not commit secrets; `.env` must stay gitignored.
+
+## Schema
+
+Highest Dexie version: **v15** (`catalogKeys` `*tokens` + review/failed/reviewed indexes on top of v14 playlists/peakPyramids). Analysis JSON `ANALYSIS_VERSION` is **5** (phrase / HPSS / rawScore fields; no Dexie bump for analysis).
+
+## UI polish + monitoring master (software, 2026-09-24)
+
+- **UI polish** â€” denser library rows / inspector padding; shared CSS variables (`--accent`, type scale, spacing); unified `.notice` banners (info/warn/alert) for library status, inspector streaming, and Mix Mode streaming; focus-visible on controls; panel-head chrome for settings-like panels. Not a design-system rewrite; Mix/Stems remain discoverable.
+- **Mastering (monitor path)** â€” `audio/mastering.ts` helpers + `audio/masterBus.ts` Web Audio bus (input gain â†’ low/high shelves â†’ soft-clip â†’ ceiling limiter â†’ output gain â†’ AnalyserNode meters). Wired into inspector `Player` and Mix Mode `Mixer` master. `MasteringPanel` with bypass, meters, settings persisted as `music-editor.mastering` (default **bypassed**). Labelled monitoring master only â€” **not** album-master export and **not** EBU R128 certification. Export still uses the original file.
+- **Tests** - `audio/mastering.test.ts` for DSP helpers / settings clamp / soft-clip / MasterBus apply. Verify 2026-09-24 CT: **442 tests / 49 files**; lint + build + desktop/job/catalog smokes green. EBU / labelled-corpus / Authenticode remain Open.
+
+
+## Empty-library UX (2026-09-24 evening)
+
+User feedback called the empty GUI the worst state: giant Mastering panel with no
+selection, postage-stamp library drop box, junk-drawer toolbar, floating track
+count, and a stacked Dexie `DatabaseClosedError` banner.
+
+Changes (UI only — no DSP rewrite, no phase claim):
+
+- **No selection:** full Mastering panel hidden; calm empty-state card + one-line
+  “Select a track to monitor mastering” hint; Import / Add CTAs when library is empty.
+- **Library empty:** centered empty state (“No tracks yet”) with Import folder / Add audio.
+- **Toolbar:** two rows (search+filters / pagination+Add folder); Analysis timeout moved to Settings.
+- **Track count:** muted text in Library pane head (not between brand and tabs).
+- **Notices:** single `notice-stack`; `DatabaseClosedError` softened to a short human
+  message + Dismiss; `db.open()` before liveQuery/scheduler; timeout no longer remounts scheduler.
+- **Selected track:** Mastering stays under Play transport with `compact`.
+
+Verify: lint + **442** tests / **49** files + build + desktop/job/catalog smokes green.
+Tip: re-run `npm run desktop:dev` from `app/` to see the empty state.

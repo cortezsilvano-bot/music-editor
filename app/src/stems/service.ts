@@ -30,6 +30,7 @@ export interface ServiceStatus {
   /** Which separation engine the service will actually use. */
   backend: "demucs" | "dsp" | null;
   model: string | null;
+  jobProtocol?: number;
   /** Populated when the service is not reachable. */
   error: string | null;
 }
@@ -46,6 +47,13 @@ export interface SeparationResult {
   sampleRate: number;
   elapsedSeconds: number;
   stems: SeparatedStem[];
+  sourceHash?: string;
+  modelId?: string;
+  modelVersion?: string;
+  checkpointHash?: string | null;
+  algorithmHash?: string;
+  device?: string;
+  fallbackReason?: string | null;
 }
 
 export interface SeparateOptions {
@@ -79,11 +87,13 @@ export async function checkService(timeoutMs = 2000): Promise<ServiceStatus> {
     const body = (await response.json()) as {
       backend?: string;
       demucs?: { model?: string };
+      jobProtocol?: number;
     };
     return {
       reachable: true,
       backend: body.backend === "demucs" ? "demucs" : "dsp",
       model: body.demucs?.model ?? null,
+      jobProtocol: body.jobProtocol ?? 1,
       error: null,
     };
   } catch (error) {

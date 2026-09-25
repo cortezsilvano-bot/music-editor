@@ -33,8 +33,10 @@ export interface EnergyFeatures {
 }
 
 export interface EnergyResult {
-  /** 1..10. */
+  /** 1..10, from the fixed intra-track weights. */
   level: number;
+  /** 0..1 weighted sum before the 1..10 map. Kept so the library can rescale. */
+  rawScore: number;
   /** 0..1, how much the contributing features agree. */
   confidence: number;
   features: EnergyFeatures;
@@ -42,6 +44,14 @@ export interface EnergyResult {
   curve: Float32Array;
   /** Ordered strongest-first, for "why is this an 8?". */
   contributions: { name: string; normalised: number; weight: number; points: number }[];
+}
+
+export interface LibraryEnergyScale {
+  /** 0..1 rank in the current library, or null when the library is too small. */
+  percentile: number | null;
+  /** 0..10 display scale from the percentile. Null when sampleSize < 2. */
+  displayLevel: number | null;
+  sampleSize: number;
 }
 
 /**
@@ -174,30 +184,7 @@ export function computeEnergy(
     bpm,
   };
 
-  // Normalisation ranges chosen from typical released material: -30 LUFS is
-  // very quiet, -6 is a loud master; 8 onsets a second is dense.
-  const normalised: NormalisedFeatures = {
-    loudness: normalise(loudnessLufs, -30, -6),
-    kick: normalise(kickStrength, 0, 6),
-    onsetDensity: normalise(onsetDensity, 0.5, 8),
-    bass: normalise(bassRatio, 0.05, 0.45),
-    highs: normalise(highFrequencyActivity, 0.02, 0.3),
-    flux: normalise(spectralFlux, 0, 40),
-    percussive: percussiveRatio,
-  };
-
-  let score = 0;
-  const contributions: EnergyResult["contributions"] = [];
-  for (const key of Object.keys(WEIGHTS) as (keyof NormalisedFeatures)[]) {
-    const weight = WEIGHTS[key];
-    const value = normalised[key];
-    const points = value * weight;
-    score += points;
-    contributions.push({ name: key, normalised: value, weight, points });
-  }
-  contributions.sort((a, b) => b.points - a.points);
-
-  const level = Math.max(1, Math.min(10, Math.round(1 + score * 9)));
+  const { score, contributions, level, normalised } = scoreEnergyFeatures(features);
 
   // Confidence: features pointing the same way is evidence; a track that is
   // loud but sparse, or busy but quiet, is genuinely ambiguous.
@@ -221,5 +208,59 @@ export function computeEnergy(
   for (let i = 0; i < curve.length; i++) if (curve[i] > curvePeak) curvePeak = curve[i];
   if (curvePeak > 0) for (let i = 0; i < curve.length; i++) curve[i] /= curvePeak;
 
-  return { level, confidence, features, curve, contributions };
+  return { level, rawScore: score, confidence, features, curve, contributions };
+}
+
+/** Weighted 0..1 score from stored raw features. Does not rewrite the features. */
+export function scoreEnergyFeatures(features: EnergyFeatures): {
+  score: number;
+  level: number;
+  normalised: NormalisedFeatures;
+  contributions: EnergyResult["contributions"];
+} {
+  const normalised: NormalisedFeatures = {
+    loudness: normalise(features.loudnessLufs, -30, -6),
+    kick: normalise(features.kickStrength, 0, 6),
+    onsetDensity: normalise(features.onsetDensity, 0.5, 8),
+    bass: normalise(features.bassRatio, 0.05, 0.45),
+    highs: normalise(features.highFrequencyActivity, 0.02, 0.3),
+    flux: normalise(features.spectralFlux, 0, 40),
+    percussive: features.percussiveRatio,
+  };
+  let score = 0;
+  const contributions: EnergyResult["contributions"] = [];
+  for (const key of Object.keys(WEIGHTS) as (keyof NormalisedFeatures)[]) {
+    const weight = WEIGHTS[key];
+    const value = normalised[key];
+    const points = value * weight;
+    score += points;
+    contributions.push({ name: key, normalised: value, weight, points });
+  }
+  contributions.sort((a, b) => b.points - a.points);
+  const level = Math.max(1, Math.min(10, Math.round(1 + score * 9)));
+  return { score, level, normalised, contributions };
+}
+
+/**
+ * Library-relative 0..10 display from stored raw scores.
+ *
+ * Percentile of this track among the library. Raw features and the intra-track
+ * 1..10 level are left untouched. Needs at least two scores.
+ */
+export function libraryEnergyDisplay(
+  rawScore: number,
+  libraryRawScores: readonly number[],
+): LibraryEnergyScale {
+  const scores = libraryRawScores.filter((s) => Number.isFinite(s));
+  if (scores.length < 2 || !Number.isFinite(rawScore)) {
+    return { percentile: null, displayLevel: null, sampleSize: scores.length };
+  }
+  const below = scores.filter((s) => s < rawScore).length;
+  const equal = scores.filter((s) => s === rawScore).length;
+  const percentile = (below + 0.5 * equal) / scores.length;
+  return {
+    percentile,
+    displayLevel: Math.round(percentile * 10),
+    sampleSize: scores.length,
+  };
 }

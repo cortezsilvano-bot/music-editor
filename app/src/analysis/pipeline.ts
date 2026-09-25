@@ -5,10 +5,11 @@
  * stages want opposite trade-offs - onsets need time resolution, chroma needs
  * frequency resolution - and nothing else is recalculated per stage.
  *
- * Results carry `analysisVersion`. Caches and stored results are keyed by it,
- * so the UI can identify stale results and offer reanalysis. Invalidation is
- * currently global; per-stage cache versions are not implemented.
+ * Results carry a compatibility version plus per-analyzer provenance. The UI
+ * detects stale stages and retains result history; reruns still use the full
+ * pipeline rather than reusing intermediate feature caches.
  */
+import { recordProvenance, type AnalysisProvenance } from "./registry";
 import {
   buildGrid,
   estimateDownbeatPhase,
@@ -16,10 +17,19 @@ import {
   type BeatGrid,
 } from "../dsp/beats";
 import { analyseStructure, type StructureResult } from "../dsp/structure";
+import { estimatePhrases, type PhraseResult } from "../dsp/phrase";
+import { medianFilterHpss, type HpssResult } from "../dsp/hpss";
 import { computeVocalActivity, type VocalActivity } from "../dsp/vocal";
 import { computeEnergy, type EnergyResult } from "../dsp/energy";
 import { computeFingerprint } from "./fingerprint";
-import { detectKey, KEY_STFT, type KeyResult } from "../dsp/key";
+import {
+  applyKeySupport,
+  computeChroma,
+  detectKey,
+  KEY_STFT,
+  scoreKeyFromChroma,
+  type KeyResult,
+} from "../dsp/key";
 import { measureLoudness, type LoudnessResult } from "../dsp/loudness";
 import { computeOnsetEnvelope } from "../dsp/onset";
 import { ANALYSIS_SAMPLE_RATE, computeStft, resample, toMono } from "../dsp/spectral";
@@ -30,7 +40,7 @@ import { estimateTempo, type TempoEstimate } from "../dsp/tempo";
  * Stored analyses with a lower version are flagged for reanalysis; manual overrides are
  * never discarded, whatever the version.
  */
-export const ANALYSIS_VERSION = 4;
+export const ANALYSIS_VERSION = 5;
 
 export interface AnalysisInput {
   /** Decoded channels at the source sample rate. Never modified. */
@@ -47,6 +57,7 @@ export interface TempoAnalysis {
 }
 
 export interface AnalysisResult {
+  provenance?: AnalysisProvenance;
   analysisVersion: number;
   durationSec: number;
   tempo: TempoAnalysis;
@@ -57,6 +68,18 @@ export interface AnalysisResult {
   key: KeyResult;
   loudness: LoudnessResult;
   energy: EnergyResult;
+  /** 8/16/32-bar phrases on the analysis grid. Recompute from the effective grid in the UI. */
+  phrases?: PhraseResult;
+  /** Median-filter HPSS energies. Heuristic split, not stems. */
+  hpss?: Pick<HpssResult, "harmonicEnergy" | "percussiveEnergy" | "percussiveRatio">;
+  /** Bass-chroma key support. Does not override a manual key. */
+  keySupport?: {
+    bassTonic: number;
+    bassMode: KeyResult["mode"];
+    bassName: string;
+    agreed: boolean;
+    method: "median-hpss-bass-chroma";
+  };
   /** Perceptual fingerprint for duplicate detection (Phase N). */
   fingerprint: Uint32Array;
   /** Share of the track carrying voice, 0..1. */
@@ -147,7 +170,20 @@ export function analyze(input: AnalysisInput, options: AnalyzeOptions = {}): Ana
   const keySpec = time("stft.key", () =>
     computeStft(signalAtRate, ANALYSIS_SAMPLE_RATE, KEY_STFT),
   );
-  const key = time("key", () => detectKey(keySpec));
+  const detectedKey = time("key", () => detectKey(keySpec));
+  const hpss = time("hpss", () => medianFilterHpss(keySpec));
+  const bassChroma = time("bassChroma", () =>
+    computeChroma(hpss.harmonic, detectedKey.tuningCents, { minHz: 40, maxHz: 250 }),
+  );
+  const bassKey = time("bassKey", () => scoreKeyFromChroma(bassChroma, detectedKey.tuningCents));
+  const key = time("keySupport", () => applyKeySupport(detectedKey, bassKey));
+  const keySupport = {
+    bassTonic: bassKey.tonic,
+    bassMode: bassKey.mode,
+    bassName: bassKey.name,
+    agreed: detectedKey.tonic === bassKey.tonic && detectedKey.mode === bassKey.mode,
+    method: "median-hpss-bass-chroma" as const,
+  };
 
   checkpoint("loudness", 0.85);
   // Measure original channels; true-peak interpolation uses precomputed kernels.
@@ -166,6 +202,7 @@ export function analyze(input: AnalysisInput, options: AnalyzeOptions = {}): Ana
   const structure = time("structure", () =>
     analyseStructure({ curve: energy.curve, grid: fitted.grid, durationSec, vocalCurve }),
   );
+  const phrases = time("phrases", () => estimatePhrases(fitted.grid, durationSec, energy.curve));
 
   checkpoint("fingerprint", 0.97);
   // Reuses the onset spectrogram, so this costs a scan rather than a transform.
@@ -173,7 +210,7 @@ export function analyze(input: AnalysisInput, options: AnalyzeOptions = {}): Ana
 
   checkpoint("done", 1);
 
-  return {
+  const result: AnalysisResult = {
     analysisVersion: ANALYSIS_VERSION,
     durationSec,
     tempo: {
@@ -190,9 +227,18 @@ export function analyze(input: AnalysisInput, options: AnalyzeOptions = {}): Ana
     loudness,
     energy,
     structure,
+    phrases,
+    hpss: {
+      harmonicEnergy: hpss.harmonicEnergy,
+      percussiveEnergy: hpss.percussiveEnergy,
+      percussiveRatio: hpss.percussiveRatio,
+    },
+    keySupport,
     fingerprint,
     vocalCoverage: vocals.coverage,
     vocalCurve,
     timings,
   };
+  result.provenance = recordProvenance(result);
+  return result;
 }

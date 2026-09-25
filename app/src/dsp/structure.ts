@@ -67,7 +67,7 @@ export interface StructureInput {
 }
 
 /** Bar starts, taken from the grid so sections land on musical boundaries. */
-function barStarts(grid: BeatGrid, durationSec: number): number[] {
+export function barStarts(grid: BeatGrid, durationSec: number): number[] {
   const beats = deriveBeatTimes(grid, durationSec);
   const first = Array.from(beats).findIndex((t) => t >= grid.firstDownbeatSec - 1e-6);
   const starts = [0];
@@ -148,15 +148,18 @@ function labelFor(
   return { label: position > 0.55 ? "Bridge" : "Vocal", confidence: 0.4 };
 }
 
-export function analyseStructure(input: StructureInput): StructureResult {
-  const { curve, grid, durationSec, vocalCurve } = input;
+export function barsFromGrid(curve: Float32Array, grid: BeatGrid, durationSec: number): BarEnergy[] {
   const starts = barStarts(grid, durationSec);
-
-  const bars: BarEnergy[] = starts.map((startSec, i) => ({
+  return starts.map((startSec, i) => ({
     startSec,
     endSec: starts[i + 1] ?? durationSec,
     energy: meanOverRange(curve, startSec, starts[i + 1] ?? durationSec),
   }));
+}
+
+export function analyseStructure(input: StructureInput): StructureResult {
+  const { curve, grid, durationSec, vocalCurve } = input;
+  const bars = barsFromGrid(curve, grid, durationSec);
 
   // Boundaries where a four-bar window's mean energy shifts, spaced at least
   // eight bars apart so a busy track does not fragment into noise.

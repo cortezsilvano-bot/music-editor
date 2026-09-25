@@ -11,12 +11,12 @@ cd app
 npm run desktop:build     # web build + NSIS installer
 ```
 
-Output lands in `app/release`:
+Output lands in `app/release` (versioned subfolders such as `release/0.3.2`):
 
 | File | Purpose |
 |---|---|
-| `MusicEditor-Setup-0.2.0.exe` | the installer (~108 MB) |
-| `MusicEditor-Setup-0.2.0.exe.blockmap` | delta-update map, used by future auto-update |
+| `MusicEditor-Setup-<version>.exe` | the installer (~112 MB) |
+| `MusicEditor-Setup-<version>.exe.blockmap` | delta-update map, used by future auto-update |
 | `win-unpacked/` | the unpacked app, runnable directly without installing |
 
 Other scripts:
@@ -26,6 +26,7 @@ Other scripts:
 | `npm run desktop:dev` | build the web assets and launch Electron against them |
 | `npm run desktop:dir` | package to `win-unpacked` only, skipping the installer |
 | `npm run electron` | launch Electron against whatever is already in `dist` |
+| `npm run test:desktop` | Playwright smoke against a temporary profile |
 
 ## Installer behaviour
 
@@ -35,7 +36,7 @@ NSIS, configured in the `build.nsis` block of `app/package.json`:
 - **Assisted, not one-click** (`oneClick: false`) — the user sees a wizard and
   can choose the install directory.
 - Creates a desktop shortcut and a Start Menu entry, both named "Music Editor".
-- Registers an uninstaller as "Music Editor 0.2.0" in Apps & Features.
+- Registers an uninstaller as "Music Editor <version>" in Apps & Features.
 
 ## Why a custom protocol instead of `file://`
 
@@ -56,11 +57,69 @@ escapes it, so a crafted URL cannot read arbitrary files.
 ## Security posture
 
 - `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`. The
-  renderer is ordinary web code with no access to Node.
+  renderer is ordinary web code with no direct Node access.
 - External links open in the system browser rather than inside the app frame.
-- There is no preload bridge, because nothing in the renderer currently needs
-  privileged access. Adding one is the route to real filesystem features —
-  see below.
+- A **preload bridge** (`electron/preload.cjs`) exposes a narrow `window.desktop`
+  API: folder/file pickers, recursive scan, permitted reads, path existence
+  checks, safe tag writes, and optional stem-service start/stop/status plus
+  server-root selection. Arbitrary filesystem access is not exposed;
+  reads/writes require a user-picked grant (except metadata-only `pathStatus`
+  for detecting missing library paths).
+
+## Native filesystem and tags
+
+Implemented:
+
+- **Import folder** with recursive audio scanning under a picked directory.
+- **Tag writing** back to MP3/FLAC with backup + temp + verify + atomic rename
+  (`electron/files.cjs`, `electron/flac.cjs`, `TagWritePanel`).
+- **Source path** stored as `filePath` for folder imports; **Relocate** updates
+  the path when the new file's SHA-256 matches (keeps analysis).
+- Audio Blobs are still stored in IndexedDB for offline playback; paths unlock
+  tag write and relocate, they do not yet replace Blob storage.
+
+## Stem service (optional)
+
+The Stems panel talks to `http://localhost:8787`. You can:
+
+1. Start it yourself with `server/run.ps1`, or
+2. Use **Start service** in the desktop Stems panel (does **not** auto-start on
+   app launch; does not bundle Demucs weights or a Python venv).
+
+### How the app finds `server/`
+
+Resolution order in `electron/stemsService.cjs`:
+
+1. User override (Choose server folder… / persisted under userData) or env
+   `MUSIC_EDITOR_SERVER_ROOT`
+2. When packaged: `process.resourcesPath/server` (copied by electron-builder
+   `extraResources`)
+3. Checkout layout: `../server` relative to `app/`
+
+`extraResources` copies **server source + requirements + run scripts only**.
+It excludes `__pycache__`, `.venv*`, `jobs/`, checkpoints/weights (`.pth` /
+`.ckpt` / `.pt`), and similar caches. **PyTorch and Demucs model weights are
+never bundled.**
+
+### Packaged install one-liner
+
+After installing the desktop app (or from an unpacked `resources/server`):
+
+```powershell
+cd "$env:LOCALAPPDATA\Programs\Music Editor\resources\server"
+# path may vary with install dir — the Stems panel shows the resolved path
+pip install -r requirements.txt
+# optional Demucs/torch already listed in requirements; DSP works without them
+```
+
+Or point the app at a checkout:
+
+```powershell
+$env:MUSIC_EDITOR_SERVER_ROOT = "F:\Dev_apps\Music_editor\server"
+```
+
+Stop only affects a process this app started. An already-running external
+server is left alone.
 
 ## Code signing
 
@@ -76,21 +135,6 @@ reputation immediately). Once you have one, set `CSC_LINK` and `CSC_KEY_PASSWORD
 in the environment and electron-builder will sign automatically — no config
 change needed.
 
-## What the desktop shell unlocks later
-
-These are not implemented yet, but Electron makes them possible where the
-browser could not:
-
-- **Real folder import** with recursive scanning of a chosen directory.
-- **Tag writing** back to the user's files, which Phase G specifies and a
-  browser cannot do at all.
-- **Missing-file detection and relocation**, since real paths exist.
-- **Storing paths instead of audio Blobs**, removing the current duplication of
-  every track's bytes into IndexedDB.
-
-Each needs a preload bridge exposing a narrow, explicit API — not
-`nodeIntegration`.
-
 ## Known build wrinkles
 
 - **`ELECTRON_RUN_AS_NODE`.** VS Code sets this in integrated terminals. If it
@@ -102,5 +146,8 @@ Each needs a preload bridge exposing a narrow, explicit API — not
 - **`EPERM ... unlink ffmpeg.dll`.** A previous Electron process still holds
   files in `release\win-unpacked`. Close any running instance and delete
   `release` before rebuilding.
-- Source maps are included in the package. They cost a few MB against a 108 MB
+- Source maps are included in the package. They cost a few MB against a ~112 MB
   installer and make a production stack trace readable, so they are kept.
+- Packaged stem supervise still requires a **system Python** and
+  `pip install -r requirements.txt` (or Choose server folder / env override).
+  Physical Demucs GPU/OOM and Authenticode remain separate acceptance gates.
